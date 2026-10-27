@@ -92,6 +92,7 @@ struct FrameData {
 struct DrawList {
     std::vector<DrawItem> items;
     std::vector<LineVertex> lines;
+    glm::mat4 shadowViewProj{1.0f};
 };
 
 struct UIList {

@@ -3,14 +3,14 @@
 #ifdef VOID_VULKAN
 [[vk::binding(0, 0)]] cbuffer Frame : register(b0) { FrameData gFrame; };
 [[vk::binding(1, 0)]] Texture2D gShadowMap : register(t0);
-[[vk::binding(2, 0)]] SamplerComparisonState gShadowSampler : register(s0);
+[[vk::binding(2, 0)]] SamplerState gShadowSampler : register(s0);
 [[vk::binding(0, 1)]] Texture2DArray gTextures : register(t1);
 [[vk::binding(1, 1)]] SamplerState gLinearSampler : register(s1);
 [[vk::push_constant]] ConstantBuffer<PushData> gPush;
 #else
 cbuffer Frame : register(b0) { FrameData gFrame; };
 Texture2D gShadowMap : register(t0);
-SamplerComparisonState gShadowSampler : register(s0);
+SamplerState gShadowSampler : register(s0);
 Texture2DArray gTextures : register(t1);
 SamplerState gLinearSampler : register(s1);
 cbuffer Push : register(b2) { PushData gPush; };
@@ -53,7 +53,7 @@ float shadowFactor(float3 worldPos, float nDotL)
         return 1.0f;
     }
 
-    float bias = max(0.0015f * (1.0f - nDotL), 0.0003f);
+    float bias = max(0.0025f * (1.0f - nDotL), 0.0006f);
     float2 texel = float2(1.0f / 2048.0f, 1.0f / 2048.0f);
     float result = 0.0f;
     [unroll]
@@ -62,8 +62,8 @@ float shadowFactor(float3 worldPos, float nDotL)
         [unroll]
         for (int x = -1; x <= 1; ++x)
         {
-            result += gShadowMap.SampleCmpLevelZero(
-                gShadowSampler, projected.xy + float2(x, y) * texel, projected.z - bias);
+            float depth = gShadowMap.SampleLevel(gShadowSampler, projected.xy + float2(x, y) * texel, 0).r;
+            result += (projected.z - bias) <= depth ? 1.0f : 0.0f;
         }
     }
     return result / 9.0f;
@@ -124,10 +124,4 @@ float4 PSMain(VSOutput input) : SV_Target
     color = lerp(color, gFrame.fog.rgb, saturate(fogAmount));
 
     return float4(finishColor(color, gFrame.params.x), 1.0f);
-}
-
-float4 PSMainEmissive(VSOutput input) : SV_Target
-{
-    float3 albedo = gTextures.Sample(gLinearSampler, float3(input.uv, gPush.material.w)).rgb * gPush.baseColor.rgb;
-    return float4(finishColor(albedo, gFrame.params.x), 1.0f);
 }

@@ -1,5 +1,6 @@
 struct ShadowPush
 {
+    float4x4 viewProj;
     float4x4 model;
 };
 
@@ -16,7 +17,21 @@ struct VSInput
     float2 uv : TEXCOORD0;
 };
 
-float4 VSMain(VSInput input) : SV_Position
+struct VSOutput
 {
-    return mul(gPush.model, float4(input.position, 1.0f));
+    float4 position : SV_Position;
+};
+
+VSOutput VSMain(VSInput input)
+{
+    VSOutput output;
+    output.position = mul(gPush.viewProj, mul(gPush.model, float4(input.position, 1.0f)));
+    return output;
+}
+
+float4 PSMain(VSOutput input) : SV_Target
+{
+    // R32_FLOAT shadow map stores the same normalized depth as a depth buffer,
+    // but can be sampled as a normal texture on every driver.
+    return float4(input.position.z, 0.0f, 0.0f, 1.0f);
 }

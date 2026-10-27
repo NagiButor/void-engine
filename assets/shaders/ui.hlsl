@@ -35,6 +35,6 @@ UIOutput VSMain(UIInput input)
 
 float4 PSMain(UIOutput input) : SV_Target
 {
-    float alpha = gFont.Sample(gFontSampler, input.uv).r;
+    float alpha = saturate(gFont.Sample(gFontSampler, input.uv).r * 1.8f);
     return float4(input.color.rgb, input.color.a * alpha);
 }

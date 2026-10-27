@@ -19,3 +19,5 @@ third_party/_deps/
 tools/dxc/
 tools/*.zip
 docs/screenshots/
+
+font_atlas.pgm

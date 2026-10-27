@@ -91,7 +91,7 @@ endif()
 # ---------------------------------------------------------------------------
 FetchContent_Declare(stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG master
+    GIT_TAG 003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(stb)

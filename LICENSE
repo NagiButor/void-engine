@@ -1,0 +1,74 @@
+V.O.I.D. Engine Source-Available License
+Version 1.0 — 2026
+
+Copyright (c) 2026 Mi5hlen (Михаил Однолетко). All rights reserved.
+
+This license applies to the V.O.I.D. Engine source code, documentation, shaders,
+and demo content in this repository, except for third-party components listed in
+THIRD_PARTY_NOTICES.md, which remain under their respective licenses.
+
+1. EVALUATION LICENSE
+
+   Subject to the terms below, the copyright holder grants you a limited,
+   non-exclusive, non-transferable, revocable license to:
+
+   a. view, download, compile and run this software for personal evaluation;
+   b. modify the software for evaluation and for development of a non-commercial
+      prototype;
+   c. keep evaluation builds on machines you own or control.
+
+2. COMMERCIAL USE
+
+   Commercial use of any kind requires a separate written commercial license
+   from the copyright holder. Commercial use includes, without limitation:
+
+   a. shipping a game or application that contains any part of this software;
+   b. selling, licensing, renting or distributing binaries or source;
+   c. using the software in a commercial product or paid service;
+   d. integrating the software into a product offered to third parties;
+   e. distributing modified versions, forks or derivative engines.
+
+   Contact the author through the GitHub repository to discuss commercial
+   licensing. No commercial rights are granted by this file.
+
+3. RESTRICTIONS
+
+   Unless a separate written license says otherwise, you may not:
+
+   a. remove or alter copyright, license or attribution notices;
+   b. redistribute this software or derivative works, in source or binary form;
+   c. sublicense, sell, rent, lease or lend this software;
+   d. represent this software as your own original work;
+   e. use the V.O.I.D. name, logo or author identity to endorse a derivative
+      without permission.
+
+4. CONTRIBUTIONS
+
+   Contributions intentionally submitted to this repository may be used by the
+   copyright holder under this license and under separate commercial licenses.
+   Do not submit code you cannot license this way.
+
+5. THIRD-PARTY COMPONENTS
+
+   This software uses third-party components under their own permissive
+   licenses. Those licenses continue to apply to those components. See
+   THIRD_PARTY_NOTICES.md. This license does not grant rights to third-party
+   trademarks or assets.
+
+6. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+   WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+7. TERMINATION
+
+   This evaluation license terminates automatically if you breach any term. On
+   termination you must stop using and delete all copies, except for copies that
+   are subject to a separate written commercial license.
+
+This is a source-available proprietary license, not an open-source license.
+It is not legal advice; obtain professional legal review before commercial use.

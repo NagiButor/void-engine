@@ -24,7 +24,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VOID_BUILD_DX12 "Build the DirectX 12 backend" ON)
 option(VOID_BUILD_VULKAN "Build the Vulkan backend" ON)
-option(VOID_BUILD_TESTS "Build engine tests" OFF)
 option(VOID_WARNINGS_AS_ERRORS "Treat engine warnings as errors" OFF)
 
 if(MSVC)
@@ -47,6 +46,11 @@ add_library(void_engine STATIC
     src/platform/Window.cpp
     src/platform/Input.cpp
     src/rhi/Backend.cpp
+    src/render/MeshFactory.cpp
+    src/render/Textures.cpp
+    src/physics/PhysicsWorld.cpp
+    src/ui/Font.cpp
+    src/audio/Audio.cpp
 )
 
 target_include_directories(void_engine
@@ -84,8 +88,13 @@ add_dependencies(void_demo void_shaders)
 
 set_target_properties(void_demo PROPERTIES
     OUTPUT_NAME "void_demo"
+    WIN32_EXECUTABLE TRUE
     VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:void_demo>"
 )
+if(MSVC)
+    # Keep the normal main() entry point while linking as a GUI application.
+    target_link_options(void_demo PRIVATE /ENTRY:mainCRTStartup)
+endif()
 
 # Assets: compiled shaders land in the build tree, fonts come from source.
 set(VOID_ASSET_OUT "${CMAKE_BINARY_DIR}/assets")
@@ -95,11 +104,6 @@ add_custom_command(TARGET void_demo POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts" "$<TARGET_FILE_DIR:void_demo>/assets/fonts"
     COMMENT "Copying V.O.I.D. assets"
 )
-
-if(VOID_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif()
 
 # A small install/export surface so the engine can later be licensed and
 # consumed by other projects without dragging the demo along.

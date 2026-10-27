@@ -79,7 +79,12 @@ void write(Level level, const char* fmt, ...) {
 VD_LOG_FN(info, Level::Info)
 VD_LOG_FN(warn, Level::Warn)
 VD_LOG_FN(error, Level::Error)
+
+#ifdef NDEBUG
+void debug(const char*, ...) {}
+#else
 VD_LOG_FN(debug, Level::Debug)
+#endif
 
 #undef VD_LOG_FN
 
