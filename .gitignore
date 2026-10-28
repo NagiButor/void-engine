@@ -21,3 +21,6 @@ tools/*.zip
 docs/screenshots/
 
 font_atlas.pgm
+
+__pycache__/
+*.pyc
