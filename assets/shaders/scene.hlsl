@@ -6,6 +6,7 @@
 [[vk::binding(2, 0)]] SamplerState gShadowSampler : register(s0);
 [[vk::binding(0, 1)]] Texture2DArray gTextures : register(t1);
 [[vk::binding(1, 1)]] SamplerState gLinearSampler : register(s1);
+[[vk::binding(2, 1)]] Texture2D gViewTexture : register(t2);
 [[vk::push_constant]] ConstantBuffer<PushData> gPush;
 #else
 cbuffer Frame : register(b0) { FrameData gFrame; };
@@ -13,6 +14,7 @@ Texture2D gShadowMap : register(t0);
 SamplerState gShadowSampler : register(s0);
 Texture2DArray gTextures : register(t1);
 SamplerState gLinearSampler : register(s1);
+Texture2D gViewTexture : register(t2);
 cbuffer Push : register(b2) { PushData gPush; };
 #endif
 
@@ -90,7 +92,16 @@ float4 PSMain(VSOutput input) : SV_Target
 {
     float3 N = normalize(input.normal);
     float3 V = normalize(gFrame.cameraPos.xyz - input.worldPos);
-    float3 albedo = gTextures.Sample(gLinearSampler, float3(input.uv, gPush.material.w)).rgb * gPush.baseColor.rgb;
+    float3 albedo;
+    if (gPush.material.w > 200.0f) {
+        albedo = gViewTexture.Sample(gLinearSampler, input.uv).rgb * gPush.baseColor.rgb;
+    } else {
+        albedo = gTextures.Sample(gLinearSampler, float3(input.uv, gPush.material.w)).rgb * gPush.baseColor.rgb;
+    }
+    // Baked viewmodel textures already contain lighting; show them as authored.
+    if (gPush.uvScale.z > 0.5f) {
+        return float4(linearToSrgb(albedo), 1.0f);
+    }
     float roughness = clamp(gPush.material.x, 0.045f, 1.0f);
     float metallic = saturate(gPush.material.y);
     float emissive = gPush.material.z;

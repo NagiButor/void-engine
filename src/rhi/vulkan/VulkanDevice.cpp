@@ -145,6 +145,13 @@ public:
         if (!createFrameResources()) return false;
         log::debug("Vulkan: descriptors");
         if (!createDescriptorInfrastructure()) return false;
+        {
+            rhi::ImageData white;
+            white.width = 1;
+            white.height = 1;
+            white.pixels = {255, 255, 255, 255};
+            if (!createViewmodelTexture(white)) return false;
+        }
         log::debug("Vulkan: pipelines");
         if (!createPipelines()) return false;
 
@@ -189,6 +196,7 @@ public:
             m_meshes.clear();
             destroyImage(m_textureArray);
             destroyImage(m_font);
+            destroyImage(m_viewTexture);
             destroyImage(m_shadowColor);
             destroyImage(m_shadowImage);
             destroyImage(m_depthImage);
@@ -196,6 +204,7 @@ public:
             if (m_shadowSampler) vkDestroySampler(m_device, m_shadowSampler, nullptr);
             if (m_fontSampler) vkDestroySampler(m_device, m_fontSampler, nullptr);
             if (m_scenePipeline) vkDestroyPipeline(m_device, m_scenePipeline, nullptr);
+            if (m_viewmodelPipeline) vkDestroyPipeline(m_device, m_viewmodelPipeline, nullptr);
             if (m_shadowPipeline) vkDestroyPipeline(m_device, m_shadowPipeline, nullptr);
             if (m_skyPipeline) vkDestroyPipeline(m_device, m_skyPipeline, nullptr);
             if (m_uiPipeline) vkDestroyPipeline(m_device, m_uiPipeline, nullptr);
@@ -403,6 +412,59 @@ public:
         return true;
     }
 
+    bool createViewmodelTexture(const ImageData& image) override {
+        if (image.pixels.empty() || image.width == 0 || image.height == 0) return false;
+        destroyImage(m_viewTexture);
+        if (!createImage(image.width, image.height, 1, VK_FORMAT_R8G8B8A8_SRGB,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         m_viewTexture)) return false;
+
+        Buffer staging;
+        const VkDeviceSize size = static_cast<VkDeviceSize>(image.width) * image.height * 4;
+        if (!createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          staging, true)) return false;
+        std::memcpy(staging.mapped, image.pixels.data(), static_cast<size_t>(size));
+
+        VkCommandBuffer cmd = beginImmediate();
+        if (cmd == VK_NULL_HANDLE) return false;
+        transitionImage(cmd, m_viewTexture.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = {image.width, image.height, 1};
+        vkCmdCopyBufferToImage(cmd, staging.buffer, m_viewTexture.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        transitionImage(cmd, m_viewTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 1);
+        endImmediate(cmd);
+        destroyBuffer(staging);
+
+        VkImageViewCreateInfo view{};
+        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view.image = m_viewTexture.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = VK_FORMAT_R8G8B8A8_SRGB;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(m_device, &view, nullptr, &m_viewTexture.view) != VK_SUCCESS) return false;
+
+        VkDescriptorImageInfo info{};
+        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        info.imageView = m_viewTexture.view;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_textureSet;
+        write.dstBinding = 2;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        write.pImageInfo = &info;
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+        return true;
+    }
+
     void render(const FrameData& frame, const DrawList& draws, const UIList& ui) override {
         if (!m_scenePipeline || !m_swapchain) return;
         m_stats = {};
@@ -530,12 +592,11 @@ public:
         ++m_stats.drawCalls;
 
         if (m_textureArray.view) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
             VkDescriptorSet sceneSets[] = {m_sceneSets[m_frameSlot], m_textureSet};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipelineLayout, 0, 2,
                                     sceneSets, 0, nullptr);
-            for (const auto& item : draws.items) {
-                if (item.mesh.id == 0 || item.mesh.id > m_meshes.size()) continue;
+            const auto drawSceneItem = [&](const DrawItem& item) {
+                if (item.mesh.id == 0 || item.mesh.id > m_meshes.size()) return;
                 const MeshGPU& mesh = m_meshes[item.mesh.id - 1];
                 VkDeviceSize offset = 0;
                 vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vb.buffer, &offset);
@@ -544,12 +605,20 @@ public:
                 push.model = item.transform;
                 push.baseColor = item.baseColor;
                 push.material = {item.roughness, item.metallic, item.emissive, static_cast<float>(item.textureLayer)};
-                push.uvScale = {item.uvScale.x, item.uvScale.y, 0.0f, 0.0f};
+                push.uvScale = {item.uvScale.x, item.uvScale.y, item.unlit ? 1.0f : 0.0f, 0.0f};
                 vkCmdPushConstants(cmd, m_scenePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    0, sizeof(PushData), &push);
                 vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
                 ++m_stats.drawCalls;
                 m_stats.triangles += mesh.indexCount / 3;
+            };
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+            for (const auto& item : draws.items) {
+                if (!item.viewmodel) drawSceneItem(item);
+            }
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_viewmodelPipeline);
+            for (const auto& item : draws.items) {
+                if (item.viewmodel) drawSceneItem(item);
             }
         }
 
@@ -1087,7 +1156,7 @@ private:
         sceneBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         m_sceneSetLayout = createSetLayout({sceneBindings[0], sceneBindings[1], sceneBindings[2]});
 
-        VkDescriptorSetLayoutBinding textureBindings[2]{};
+        VkDescriptorSetLayoutBinding textureBindings[3]{};
         textureBindings[0].binding = 0;
         textureBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         textureBindings[0].descriptorCount = 1;
@@ -1096,7 +1165,11 @@ private:
         textureBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         textureBindings[1].descriptorCount = 1;
         textureBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        m_textureSetLayout = createSetLayout({textureBindings[0], textureBindings[1]});
+        textureBindings[2].binding = 2;
+        textureBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        textureBindings[2].descriptorCount = 1;
+        textureBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        m_textureSetLayout = createSetLayout({textureBindings[0], textureBindings[1], textureBindings[2]});
 
         VkDescriptorSetLayoutBinding uiBindings[2]{};
         uiBindings[0] = textureBindings[0];
@@ -1107,7 +1180,7 @@ private:
         sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         sizes[0].descriptorCount = kFramesInFlight;
         sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        sizes[1].descriptorCount = kFramesInFlight + 2;
+        sizes[1].descriptorCount = kFramesInFlight + 3;
         sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;
         sizes[2].descriptorCount = kFramesInFlight + 2;
         VkDescriptorPoolCreateInfo pool{};
@@ -1199,7 +1272,8 @@ private:
         return layout;
     }
 
-    bool createScenePipeline(const std::vector<u8>& vs, const std::vector<u8>& ps, bool sky) {
+    bool createScenePipeline(const std::vector<u8>& vs, const std::vector<u8>& ps, bool sky,
+                             bool depthTest = true) {
         VkShaderModule vsModule = createShaderModule(vs);
         VkShaderModule psModule = createShaderModule(ps);
         if (!vsModule || !psModule) return false;
@@ -1277,7 +1351,7 @@ private:
         info.pColorBlendState = &colorBlend;
         info.pDynamicState = &dynamic;
         info.layout = sky ? m_skyPipelineLayout : m_scenePipelineLayout;
-        VkPipeline* target = sky ? &m_skyPipeline : &m_scenePipeline;
+        VkPipeline* target = sky ? &m_skyPipeline : (depthTest ? &m_scenePipeline : &m_viewmodelPipeline);
         VkResult result = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, target);
         if (result != VK_SUCCESS) log::error("Vulkan %s pipeline failed: %s", sky ? "sky" : "scene", vkResultName(result));
         vkDestroyShaderModule(m_device, vsModule, nullptr);
@@ -1393,6 +1467,7 @@ private:
         if (!m_scenePipelineLayout || !m_skyPipelineLayout || !m_shadowPipelineLayout || !m_uiPipelineLayout) return false;
 
         if (!createScenePipeline(sceneVS, scenePS, false)) { log::error("Vulkan scene pipeline failed"); return false; }
+        if (!createScenePipeline(sceneVS, scenePS, false, false)) { log::error("Vulkan viewmodel pipeline failed"); return false; }
         if (!createScenePipeline(skyVS, skyPS, true)) { log::error("Vulkan sky pipeline failed"); return false; }
         if (!createUiPipeline(uiVS, uiPS)) { log::error("Vulkan UI pipeline failed"); return false; }
 
@@ -1549,6 +1624,7 @@ private:
     ImageGPU m_shadowColor;
     ImageGPU m_textureArray;
     ImageGPU m_font;
+    ImageGPU m_viewTexture;
     VkSampler m_textureSampler = VK_NULL_HANDLE;
     VkSampler m_shadowSampler = VK_NULL_HANDLE;
     VkSampler m_fontSampler = VK_NULL_HANDLE;
@@ -1573,6 +1649,7 @@ private:
     VkPipelineLayout m_shadowPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_uiPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_scenePipeline = VK_NULL_HANDLE;
+    VkPipeline m_viewmodelPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
     VkPipeline m_skyPipeline = VK_NULL_HANDLE;
     VkPipeline m_uiPipeline = VK_NULL_HANDLE;

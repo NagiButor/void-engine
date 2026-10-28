@@ -6,6 +6,7 @@
 #include "void/physics/PhysicsWorld.h"
 #include "void/platform/Input.h"
 #include "void/platform/Window.h"
+#include "void/render/GLTFLoader.h"
 #include "void/render/MeshFactory.h"
 #include "void/render/Textures.h"
 #include "void/rhi/RHI.h"
@@ -199,6 +200,8 @@ struct ViewPart {
     float roughness = 0.4f;
     float metallic = 0.85f;
     float emissive = 0.0f;
+    bool unlit = false;
+    bool viewTexture = false;
 };
 
 enum class State { Menu, Playing, Paused };
@@ -273,12 +276,14 @@ private:
     bool m_muted = false;
     bool m_keepHeld = false;
     float m_accumulator = 0.0f;
+    float m_footstepTimer = 0.0f;
     float m_time = 0.0f;
     float m_fps = 60.0f;
     u32 m_fpsFrames = 0;
     float m_fpsTimer = 0.0f;
     u32 m_frameCount = 0;
 
+    rhi::MeshHandle m_manipulatorMesh;
     rhi::MeshHandle m_beamMesh;
     std::array<rhi::MeshHandle, static_cast<size_t>(PropKind::Count)> m_propMeshes{};
     std::vector<StaticDraw> m_staticDraws;
@@ -339,34 +344,49 @@ bool Game::initialize() {
     m_propMeshes[static_cast<size_t>(PropKind::BigPlank)] = makeMesh(mesh::box({2.1f, 0.08f, 0.35f}));
     if (!m_beamMesh) return false;
 
-    // First-person manipulator. These are world-space draws composed with the
-    // inverse camera transform each frame, so the tool stays in view.
-    const rhi::MeshHandle vmBody = makeMesh(mesh::box({0.045f, 0.055f, 0.18f}));
-    const rhi::MeshHandle vmRear = makeMesh(mesh::box({0.055f, 0.065f, 0.06f}));
-    const rhi::MeshHandle vmBarrel = makeMesh(mesh::cylinder(0.03f, 0.22f, 12));
-    const rhi::MeshHandle vmProng = makeMesh(mesh::box({0.012f, 0.015f, 0.2f}));
-    const rhi::MeshHandle vmGrip = makeMesh(mesh::box({0.035f, 0.10f, 0.05f}));
-    const rhi::MeshHandle vmCore = makeMesh(mesh::sphere(0.022f, 16, 12));
-    m_viewParts.push_back({vmBody, trs({0.32f, -0.28f, -1.12f}, glm::quat{1,0,0,0}),
-                           {0.18f, 0.20f, 0.22f, 1}, 0.4f, 0.55f, 0.05f});
-    m_viewParts.push_back({vmRear, trs({0.32f, -0.28f, -1.0f}, glm::quat{1,0,0,0}),
-                           {0.30f, 0.31f, 0.32f, 1}, 0.45f, 0.35f, 0.03f});
-    m_viewParts.push_back({vmBarrel, trs({0.32f, -0.26f, -1.3f},
-                           glm::angleAxis(kPi * 0.5f, glm::vec3(1,0,0))),
-                           {0.52f, 0.50f, 0.44f, 1}, 0.25f, 0.8f, 0.02f});
-    m_viewParts.push_back({vmProng, trs({0.37f, -0.235f, -1.38f},
-                           glm::angleAxis(-0.12f, glm::vec3(0,1,0))),
-                           {0.42f, 0.40f, 0.36f, 1}, 0.3f, 0.7f, 0.02f});
-    m_viewParts.push_back({vmProng, trs({0.27f, -0.235f, -1.38f},
-                           glm::angleAxis(0.12f, glm::vec3(0,1,0))),
-                           {0.42f, 0.40f, 0.36f, 1}, 0.3f, 0.7f, 0.02f});
-    m_viewParts.push_back({vmGrip, trs({0.32f, -0.40f, -1.06f}, glm::quat{1,0,0,0}),
-                           {0.12f, 0.11f, 0.09f, 1}, 0.8f, 0.1f, 0.0f});
-    m_viewParts.push_back({vmCore, trs({0.32f, -0.22f, -1.22f}, glm::quat{1,0,0,0}),
-                           {1.0f, 0.42f, 0.08f, 1}, 0.3f, 0.2f, 3.5f});
-    const rhi::MeshHandle vmAccent = makeMesh(mesh::box({0.004f, 0.012f, 0.14f}));
-    m_viewParts.push_back({vmAccent, trs({0.273f, -0.26f, -1.12f}, glm::quat{1,0,0,0}),
-                           {1.0f, 0.48f, 0.1f, 1}, 0.3f, 0.2f, 2.8f});
+    // First-person manipulator. The GLB is authored front-toward +Z, so it is
+    // rotated 180 degrees to point down the camera's -Z forward axis.
+    const gltf::Model manipulator =
+        gltf::loadGLB(Paths::asset("models/void-manipulator.glb").string(), 2048);
+    if (manipulator.valid()) {
+        m_manipulatorMesh = makeMesh(manipulator.mesh);
+        if (!manipulator.baseColor.pixels.empty()) {
+            if (!m_device.createViewmodelTexture(manipulator.baseColor)) {
+                log::warn("Manipulator texture upload failed");
+            }
+        }
+        ViewPart part;
+        part.mesh = m_manipulatorMesh;
+        part.local = glm::translate(glm::mat4(1.0f), {0.26f, -0.21f, -1.04f}) *
+                     glm::rotate(glm::mat4(1.0f), kPi + 0.06f, glm::vec3(0.0f, 1.0f, 0.0f)) *
+                     glm::scale(glm::mat4(1.0f), glm::vec3(0.55f));
+        part.color = {1.0f, 1.0f, 1.0f, 1.0f};
+        part.roughness = 1.0f;
+        part.metallic = 0.0f;
+        part.emissive = 0.0f;
+        part.unlit = true;
+        part.viewTexture = true;
+        m_viewParts.push_back(part);
+    } else {
+        log::warn("Manipulator model missing; using a simple placeholder");
+        const rhi::MeshHandle body = makeMesh(mesh::box({0.05f, 0.06f, 0.22f}));
+        const rhi::MeshHandle barrel = makeMesh(mesh::cylinder(0.028f, 0.26f, 12));
+        ViewPart gripPart;
+        gripPart.mesh = body;
+        gripPart.local = trs({0.30f, -0.26f, -1.02f}, glm::quat{1, 0, 0, 0});
+        gripPart.color = {0.13f, 0.15f, 0.18f, 1.0f};
+        gripPart.roughness = 0.4f;
+        gripPart.metallic = 0.8f;
+        m_viewParts.push_back(gripPart);
+        ViewPart barrelPart;
+        barrelPart.mesh = barrel;
+        barrelPart.local = trs({0.30f, -0.24f, -1.24f},
+                               glm::angleAxis(kPi * 0.5f, glm::vec3(1, 0, 0)));
+        barrelPart.color = {0.42f, 0.40f, 0.35f, 1.0f};
+        barrelPart.roughness = 0.3f;
+        barrelPart.metallic = 0.8f;
+        m_viewParts.push_back(barrelPart);
+    }
 
     if (!m_physics.initialize()) return false;
     m_player = m_physics.createPlayer(m_playerSpawn);
@@ -730,6 +750,15 @@ void Game::updatePlayer(float dt) {
     }
 
     const float speed = glm::length(glm::vec2(velocity.x, velocity.z));
+    if (grounded && speed > 0.8f) {
+        m_footstepTimer -= dt;
+        if (m_footstepTimer <= 0.0f) {
+            m_audio.footstep(speed);
+            m_footstepTimer = glm::clamp(0.62f - speed * 0.04f, 0.32f, 0.55f);
+        }
+    } else if (!grounded) {
+        m_footstepTimer = 0.12f;
+    }
     const float bob = grounded ? std::sin(m_time * (6.0f + speed)) * 0.018f * std::min(1.0f, speed / 5.0f) : 0.0f;
     m_camera.position = bodyPos + glm::vec3(0.0f, 0.8f + bob, 0.0f);
     m_camera.fovDegrees = sprint && speed > 5.0f ? 81.0f : 78.0f;
@@ -942,8 +971,8 @@ void Game::buildViewmodel(rhi::DrawList& draws) {
     for (const auto& part : m_viewParts) {
         rhi::DrawItem item;
         item.mesh = part.mesh;
-        item.transform = camWorld * glm::translate(glm::mat4(1.0f), {0.40f, -0.22f, -0.38f}) * part.local;
-        item.textureLayer = textures::White;
+        item.transform = camWorld * part.local;
+        item.textureLayer = part.viewTexture ? 255u : textures::White;
         item.baseColor = part.color;
         item.roughness = part.roughness;
         item.metallic = part.metallic;
@@ -951,6 +980,7 @@ void Game::buildViewmodel(rhi::DrawList& draws) {
         item.uvScale = {1, 1};
         item.castShadow = false;
         item.viewmodel = true;
+        item.unlit = part.unlit;
         draws.items.push_back(item);
     }
 }
@@ -958,9 +988,7 @@ void Game::buildViewmodel(rhi::DrawList& draws) {
 void Game::buildBeam(rhi::DrawList& draws) {
     if (!m_held) return;
     const glm::mat4 camWorld = glm::inverse(m_camera.view());
-    const glm::vec3 start = glm::vec3(camWorld *
-        glm::translate(glm::mat4(1.0f), {0.40f, -0.22f, -0.38f}) *
-        glm::vec4(0.32f, -0.22f, -1.45f, 1.0f));
+    const glm::vec3 start = glm::vec3(camWorld * glm::vec4(0.244f, -0.195f, -1.33f, 1.0f));
     glm::vec3 end = m_physics.getPosition(m_held->body);
     const glm::vec3 toStart = glm::normalize(start - end);
     end += toStart * 0.28f;

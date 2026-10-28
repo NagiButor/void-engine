@@ -167,6 +167,12 @@ public:
         log::debug("DX12: creating UI buffer");
         if (!createUIBuffer()) return false;
 
+        rhi::ImageData white;
+        white.width = 1;
+        white.height = 1;
+        white.pixels = {255, 255, 255, 255};
+        if (!createViewmodelTexture(white)) return false;
+
         log::info("DX12 adapter: %s", m_adapterName.c_str());
         log::info("DX12 validation: %s", m_debug ? "on" : "off");
         return true;
@@ -177,6 +183,7 @@ public:
         waitIdle();
         m_textureArray = {};
         m_fontTexture = {};
+        m_viewTexture = {};
         if (m_uiMapped) {
             m_uiBuffer->Unmap(0, nullptr);
             m_uiMapped = nullptr;
@@ -198,6 +205,7 @@ public:
         m_rtvHeap.Reset();
         m_srvHeap.Reset();
         m_scenePSO.Reset();
+        m_viewmodelPSO.Reset();
         m_shadowPSO.Reset();
         m_skyPSO.Reset();
         m_uiPSO.Reset();
@@ -428,9 +436,75 @@ public:
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
-        m_fontTexture.descriptorIndex = 2;
+        m_fontTexture.descriptorIndex = 3;
         m_device->CreateShaderResourceView(m_fontTexture.resource.Get(), &srv,
                                            descriptorHandle(m_fontTexture.descriptorIndex));
+        return true;
+    }
+
+    bool createViewmodelTexture(const ImageData& image) override {
+        if (image.pixels.empty() || image.width == 0 || image.height == 0) return false;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = image.width;
+        desc.Height = image.height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        m_viewTexture.resource.Reset();
+        HRESULT hr = m_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&m_viewTexture.resource));
+        if (FAILED(hr)) {
+            check(hr, "CreateViewmodelTexture");
+            return false;
+        }
+
+        const u32 rowPitch = alignTo(image.width * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        ComPtr<ID3D12Resource> upload;
+        if (!createUploadBuffer(static_cast<u64>(rowPitch) * image.height,
+                                D3D12_RESOURCE_STATE_GENERIC_READ, upload)) return false;
+        u8* mapped = nullptr;
+        upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        for (u32 y = 0; y < image.height; ++y) {
+            std::memcpy(mapped + static_cast<u64>(y) * rowPitch,
+                        image.pixels.data() + static_cast<u64>(y) * image.width * 4,
+                        image.width * 4);
+        }
+        upload->Unmap(0, nullptr);
+
+        auto cmd = beginImmediate();
+        if (!cmd) return false;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = m_viewTexture.resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = upload.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        src.PlacedFootprint.Footprint.Width = image.width;
+        src.PlacedFootprint.Footprint.Height = image.height;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = rowPitch;
+        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        transitionTexture(cmd.Get(), m_viewTexture.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1);
+        endImmediate(cmd);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        m_viewTexture.descriptorIndex = 2;
+        m_device->CreateShaderResourceView(m_viewTexture.resource.Get(), &srv,
+                                           descriptorHandle(m_viewTexture.descriptorIndex));
         return true;
     }
 
@@ -767,7 +841,7 @@ private:
         samplers[1].ShaderRegister = 1;
         samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        D3D12_DESCRIPTOR_RANGE ranges[3]{};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[0].NumDescriptors = 1;
         ranges[0].BaseShaderRegister = 0;
@@ -776,13 +850,17 @@ private:
         ranges[1].NumDescriptors = 1;
         ranges[1].BaseShaderRegister = 1;
         ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[2].NumDescriptors = 1;
+        ranges[2].BaseShaderRegister = 2;
+        ranges[2].OffsetInDescriptorsFromTableStart = 2;
 
         D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.NumDescriptorRanges = 3;
         params[1].DescriptorTable.pDescriptorRanges = ranges;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -918,6 +996,16 @@ private:
         pso.SampleMask = UINT_MAX;
         if (FAILED(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scenePSO)))) {
             log::error("DX12 scene PSO failed");
+            return false;
+        }
+
+        // The viewmodel is drawn after the world with depth testing disabled so
+        // it never clips into a wall the player is standing next to.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC viewPso = pso;
+        viewPso.DepthStencilState.DepthEnable = FALSE;
+        viewPso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        if (FAILED(m_device->CreateGraphicsPipelineState(&viewPso, IID_PPV_ARGS(&m_viewmodelPSO)))) {
+            log::error("DX12 viewmodel PSO failed");
             return false;
         }
 
@@ -1073,9 +1161,8 @@ private:
         m_commandList->DrawInstanced(3, 1, 0, 0);
         ++m_stats.drawCalls;
 
-        m_commandList->SetPipelineState(m_scenePSO.Get());
-        for (const auto& item : draws.items) {
-            if (item.mesh.id == 0 || item.mesh.id > m_meshes.size()) continue;
+        const auto drawSceneItem = [&](const DrawItem& item) {
+            if (item.mesh.id == 0 || item.mesh.id > m_meshes.size()) return;
             const MeshGPU& mesh = m_meshes[item.mesh.id - 1];
             m_commandList->IASetVertexBuffers(0, 1, &mesh.vbView);
             m_commandList->IASetIndexBuffer(&mesh.ibView);
@@ -1083,11 +1170,20 @@ private:
             push.model = item.transform;
             push.baseColor = item.baseColor;
             push.material = {item.roughness, item.metallic, item.emissive, static_cast<float>(item.textureLayer)};
-            push.uvScale = {item.uvScale.x, item.uvScale.y, 0.0f, 0.0f};
+            push.uvScale = {item.uvScale.x, item.uvScale.y, item.unlit ? 1.0f : 0.0f, 0.0f};
             m_commandList->SetGraphicsRoot32BitConstants(2, 28, &push, 0);
             m_commandList->DrawIndexedInstanced(mesh.indexCount, 1, 0, 0, 0);
             ++m_stats.drawCalls;
             m_stats.triangles += mesh.indexCount / 3;
+        };
+
+        m_commandList->SetPipelineState(m_scenePSO.Get());
+        for (const auto& item : draws.items) {
+            if (!item.viewmodel) drawSceneItem(item);
+        }
+        m_commandList->SetPipelineState(m_viewmodelPSO.Get());
+        for (const auto& item : draws.items) {
+            if (item.viewmodel) drawSceneItem(item);
         }
 
         if (!ui.vertices.empty()) {
@@ -1095,7 +1191,7 @@ private:
             if (bytes <= m_uiCapacity) {
                 m_commandList->SetGraphicsRootSignature(m_uiRoot.Get());
                 m_commandList->SetPipelineState(m_uiPSO.Get());
-                m_commandList->SetGraphicsRootDescriptorTable(1, descriptorHandleGPU(2));
+                m_commandList->SetGraphicsRootDescriptorTable(1, descriptorHandleGPU(3));
                 UIPush push;
                 push.ortho = glm::ortho(0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, -1.0f, 1.0f);
                 m_commandList->SetGraphicsRoot32BitConstants(0, 20, &push, 0);
@@ -1184,10 +1280,12 @@ private:
     std::vector<MeshGPU> m_meshes;
     TextureGPU m_textureArray;
     TextureGPU m_fontTexture;
+    TextureGPU m_viewTexture;
     ComPtr<ID3D12RootSignature> m_sceneRoot;
     ComPtr<ID3D12RootSignature> m_shadowRoot;
     ComPtr<ID3D12RootSignature> m_uiRoot;
     ComPtr<ID3D12PipelineState> m_scenePSO;
+    ComPtr<ID3D12PipelineState> m_viewmodelPSO;
     ComPtr<ID3D12PipelineState> m_shadowPSO;
     ComPtr<ID3D12PipelineState> m_skyPSO;
     ComPtr<ID3D12PipelineState> m_uiPSO;

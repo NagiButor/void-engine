@@ -48,6 +48,7 @@ add_library(void_engine STATIC
     src/rhi/Backend.cpp
     src/render/MeshFactory.cpp
     src/render/Textures.cpp
+    src/render/GLTFLoader.cpp
     src/physics/PhysicsWorld.cpp
     src/ui/Font.cpp
     src/audio/Audio.cpp
@@ -65,6 +66,7 @@ target_link_libraries(void_engine
         box3d::box3d
         SDL3::SDL3-static
 )
+target_link_libraries(void_engine PRIVATE nlohmann_json::nlohmann_json)
 
 if(VOID_BUILD_DX12)
     target_sources(void_engine PRIVATE src/rhi/dx12/DX12Device.cpp)
@@ -102,6 +104,8 @@ add_custom_command(TARGET void_demo POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:void_demo>/assets"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${VOID_ASSET_OUT}" "$<TARGET_FILE_DIR:void_demo>/assets"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts" "$<TARGET_FILE_DIR:void_demo>/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio" "$<TARGET_FILE_DIR:void_demo>/assets/audio"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/assets/models" "$<TARGET_FILE_DIR:void_demo>/assets/models"
     COMMENT "Copying V.O.I.D. assets"
 )
 

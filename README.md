@@ -33,6 +33,8 @@ This is a real, running **vertical slice**, not a finished commercial engine. Th
 - Procedural 512² material texture array: concrete, wood, crate stencil, metal, hazard stripes, barrel, sign.
 - Custom 2D UI renderer and baked font atlas (Latin + Cyrillic) for the menu, HUD, hotbar, target labels and pause screen.
 - Runtime backend dialog or `--rhi=dx12|vulkan`.
+- Generated 48 kHz sound effects (MOSS-SoundEffect v2.0) for material impacts, grab/throw, spawning, slow motion, UI and footsteps, with a synthesized fallback if the clips are missing.
+- GLB 2.0 viewmodel loader with an embedded 2048? baked base-color texture, an unlit path for baked lighting, and a dedicated high-resolution viewmodel texture binding.
 
 ### Physics and interaction
 
@@ -46,7 +48,7 @@ This is a real, running **vertical slice**, not a finished commercial engine. Th
   - **F** to throw hard;
   - mouse wheel to change hold distance;
   - held shapes are filtered out of the player's collision set.
-- Physics event stream drives impact sounds by surface material.
+- Physics event stream drives material-specific impact sounds (wood, metal, concrete, plastic) and speed-based footsteps.
 - Spawn/reset/slow-motion, 50 hand-placed props, a crate pyramid, shelves, ramp, platform, domino row, seesaw and a raised cargo deck.
 
 ### Engine layer
@@ -131,6 +133,22 @@ Useful flags:
 
 Logs are written to `void.log` in the executable directory. The demo is a GUI subsystem executable; use the log file when launching without a console.
 
+## Sound effects
+
+The shipped clips in `assets/audio/sfx/` were generated with
+[MOSS-SoundEffect v2.0](https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0)
+(Apache-2.0). Prompts, durations and seeds live in `tools/generate_sfx.py`, so the
+set can be regenerated with either the official Hugging Face Space or a local
+checkout of the [MOSS-TTS](https://github.com/OpenMOSS/MOSS-TTS) pipeline:
+
+```powershell
+python tools/generate_sfx.py --backend space --hf-token $env:HF_TOKEN
+python tools/generate_sfx.py --backend local --moss-dir C:/MOSS-TTS --device cpu
+```
+
+If a clip is missing, AudioKit falls back to a small procedural synthesizer, so
+the demo still has sound on a bare checkout.
+
 ## Architecture
 
 ```text
@@ -139,7 +157,7 @@ include/void/
   core/         Types, logging, paths
   physics/      PhysicsWorld (Box3D C API wrapper)
   platform/     SDL3 window + input
-  render/       Camera, mesh factory, procedural textures
+  render/       Camera, mesh factory, procedural textures, GLB loader
   rhi/          Backend interface and stats
   ui/           Bitmap font + UI vertex list
 
@@ -167,6 +185,7 @@ The **engine** owns platform, renderer, physics, UI and audio facilities. The **
 ### Renderer notes
 
 - The same HLSL sources compile with DXC to DXIL and SPIR-V; entry points are `VSMain` / `PSMain`.
+- The GLB loader handles static meshes with embedded PNG base-color textures. It deliberately ignores animation, skinning and compressed-texture extensions; the manipulator viewmodel is rendered with a dedicated 2048? texture and an unlit path because its atlas already contains baked lighting.
 - Vulkan uses dynamic rendering and a negative viewport height so both backends share the same world-space matrices and UI projection.
 - The shadow pass renders depth into a floating-point color target; the scene samples it as an ordinary `Texture2D`, avoiding a known Intel depth-SRV issue.
 - UI lives in screen pixels and is uploaded into a dynamic vertex buffer each frame.
@@ -208,4 +227,5 @@ For commercial licensing, contact the author through the GitHub repository.
 - **Vulkan loading:** volk, MIT; Vulkan-Headers, Apache-2.0
 - **Font rasterization:** stb_truetype, MIT; Roboto, Apache-2.0
 - **Shader compiler:** DirectXShaderCompiler, build-time tool
+- **Sound effects:** MOSS-SoundEffect v2.0 by the OpenMOSS team, Apache-2.0
 - Inspired by the Half-Life 2 physics demonstration at E3 2003.

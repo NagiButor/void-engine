@@ -60,6 +60,7 @@ struct DrawItem {
     glm::vec2 uvScale{1.0f, 1.0f};
     bool castShadow = true;
     bool viewmodel = false;
+    bool unlit = false;
 };
 
 struct LineVertex {
@@ -120,6 +121,8 @@ public:
     virtual MeshHandle createMesh(const MeshData& mesh) = 0;
     virtual bool createTextureArray(const std::vector<ImageData>& layers) = 0;
     virtual bool createFontTexture(const ImageData& image) = 0;
+    // Separate high-resolution texture for the first-person viewmodel.
+    virtual bool createViewmodelTexture(const ImageData& image) = 0;
 
     virtual void render(const FrameData& frame, const DrawList& draws, const UIList& ui) = 0;
 
