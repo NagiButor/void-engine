@@ -358,7 +358,7 @@ bool Game::initialize() {
         ViewPart part;
         part.mesh = m_manipulatorMesh;
         part.local = glm::translate(glm::mat4(1.0f), {0.26f, -0.21f, -1.04f}) *
-                     glm::rotate(glm::mat4(1.0f), kPi + 0.06f, glm::vec3(0.0f, 1.0f, 0.0f)) *
+                     glm::rotate(glm::mat4(1.0f), kPi + 0.14f, glm::vec3(0.0f, 1.0f, 0.0f)) *
                      glm::scale(glm::mat4(1.0f), glm::vec3(0.55f));
         part.color = {1.0f, 1.0f, 1.0f, 1.0f};
         part.roughness = 1.0f;
@@ -988,7 +988,7 @@ void Game::buildViewmodel(rhi::DrawList& draws) {
 void Game::buildBeam(rhi::DrawList& draws) {
     if (!m_held) return;
     const glm::mat4 camWorld = glm::inverse(m_camera.view());
-    const glm::vec3 start = glm::vec3(camWorld * glm::vec4(0.244f, -0.195f, -1.33f, 1.0f));
+    const glm::vec3 start = glm::vec3(camWorld * glm::vec4(0.222f, -0.195f, -1.33f, 1.0f));
     glm::vec3 end = m_physics.getPosition(m_held->body);
     const glm::vec3 toStart = glm::normalize(start - end);
     end += toStart * 0.28f;

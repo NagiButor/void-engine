@@ -4,9 +4,10 @@ These clips are generated with **MOSS-SoundEffect v2.0** by the OpenMOSS team
 (Apache-2.0), using the prompts, durations and seeds in
 [`tools/generate_sfx.py`](../../../tools/generate_sfx.py).
 
-They are 48 kHz mono WAV files, normalized and trimmed at load time by
-`vd::AudioKit`. If a file is missing, the engine falls back to its small
-procedural synthesizer, so the demo still runs.
+They are 48 kHz mono WAV files, shaped for gameplay by
+[`tools/postprocess_sfx.py`](../../../tools/postprocess_sfx.py) and normalized/
+trimmed at load time by `vd::AudioKit`. If a file is missing, the engine falls
+back to its small procedural synthesizer, so the demo still runs.
 
 | File | Used for |
 | --- | --- |
@@ -26,5 +27,6 @@ the [MOSS-TTS](https://github.com/OpenMOSS/MOSS-TTS) pipeline:
 
 ```powershell
 python tools/generate_sfx.py --backend space --hf-token $env:HF_TOKEN
-python tools/generate_sfx.py --backend local --moss-dir C:/MOSS-TTS --device cpu
+python tools/generate_sfx.py --backend local --moss-dir C:/MOSS-TTS --device cpu --steps 30
+python tools/postprocess_sfx.py
 ```

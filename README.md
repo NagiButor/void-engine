@@ -143,8 +143,14 @@ checkout of the [MOSS-TTS](https://github.com/OpenMOSS/MOSS-TTS) pipeline:
 
 ```powershell
 python tools/generate_sfx.py --backend space --hf-token $env:HF_TOKEN
-python tools/generate_sfx.py --backend local --moss-dir C:/MOSS-TTS --device cpu
+python tools/generate_sfx.py --backend local --moss-dir C:/MOSS-TTS --device cpu --steps 30
+python tools/postprocess_sfx.py
 ```
+
+`postprocess_sfx.py` shapes the raw model output for gameplay: short attack/decay
+envelopes, low-pass filtering, a low-frequency thump for impacts and a crisp
+transient for UI. Local CPU generation uses fp32 without autocast; a 30-step
+batch takes roughly 45 minutes on a 4-core laptop CPU.
 
 If a clip is missing, AudioKit falls back to a small procedural synthesizer, so
 the demo still has sound on a bare checkout.
@@ -196,7 +202,7 @@ Measured on the development laptop:
 
 - **DirectX 12, Intel HD Graphics 530, 1280×720:** 59–60 FPS with 50 props.
 - **Vulkan, NVIDIA GTX 960M, 1280×720:** 60 FPS.
-- ~95 draw calls and ~30k triangles for the whole demo.
+- ~96 draw calls and ~40k triangles for the whole demo, including the 9.7k-triangle manipulator.
 - 2 frames in flight, 2048² shadow map, 8-layer 512² texture array.
 
 ## Roadmap

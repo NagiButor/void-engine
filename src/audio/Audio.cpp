@@ -224,7 +224,7 @@ void AudioKit::spawn() {
 }
 
 void AudioKit::slowmo(bool active) {
-    if (!play(active ? "slowmo_on" : "slowmo_off", 0.9f)) {
+    if (!play(active ? "slowmo_on" : "slowmo_off", 0.55f)) {
         push(active ? makeTone(220.0f, 55.0f, 0.55f, 0.1f, true, 0.03f)
                     : makeTone(60.0f, 220.0f, 0.4f, 0.1f, false, 0.0f));
     }
