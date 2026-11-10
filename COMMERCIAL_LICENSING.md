@@ -25,7 +25,7 @@ This is a starting point for commercial terms, not a signed agreement. Have a la
 - Confidentiality and source escrow (optional).
 - Warranties, indemnity and liability limits.
 - Termination and post-termination obligations.
-- Third-party notices and compliance (Box3D, SDL3, GLM, volk, Vulkan-Headers, stb, Roboto, DXC, MOSS-SoundEffect-generated clips).
+- Third-party notices and compliance (wgpu, winit, Rapier, glam, egui, rodio, Roboto, and MOSS-SoundEffect-generated clips; see THIRD_PARTY_NOTICES.md and Cargo.lock).
 - Governing law and jurisdiction.
 
 ## Contact
