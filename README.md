@@ -1,15 +1,14 @@
 # V.O.I.D. Engine
 
-**Virtual Objects & Interactive Dynamics** — native Rust engine and an interactive
-industrial physics laboratory for Windows.
+**Virtual Objects & Interactive Dynamics** — native Rust 3D engine (`wgpu` + Rapier 3D) with deferred PBR lighting, omnidirectional point-light shadows, dynamic day/night cycle and a dev-textured lighting test room.
 
 The **0.2 Rust runtime** lives in `crates/void-engine` and `crates/void-demo`.
-Rendering, window/input, physics, audio, the scene and the first-person rig run
-from a Cargo workspace.
 
-![Rust Physics Lab — DirectX 12](docs/rust-game.png)
+![Deferred daylight & dev-textured test room — Vulkan](docs/rust-game.png)
 
-![Rust manipulator and grab — Vulkan](docs/rust-grab.png)
+![Night sky, moonlight & 6 draggable shadow-casting point lights](docs/rust-night.png)
+
+![Sun & Day/Night control submenu at sunset](docs/rust-sun.png)
 
 ## Build and run
 
@@ -27,63 +26,50 @@ Executable: `target/release/void_demo.exe`.
 ```powershell
 # Package the executable and assets into build/bin/Release:
 .\tools\build-rust.ps1
-.\build\bin\Release\void_demo.exe --rhi=dx12 --autostart
+.\build\bin\Release\void_demo.exe --rhi=vulkan --autostart
 ```
 
 Assets are found beside the executable, in a repository ancestor, or through
 `VOID_ASSETS` (an absolute path to `assets`). Settings persist as `settings.toml`
-beside the executable. CLI resolution/vsync options override saved settings.
+beside the executable. CLI options override saved settings for the session.
 
-## What changed
+## Features
 
-- **Rust workspace:** reusable engine library, separate game binary, pinned
-  `Cargo.lock`; `wgpu` for native DX12/Vulkan, `winit` for input/windowing,
-  Rapier for rigid bodies and `rodio` for device output.
-- **Lighting:** linear HDR intermediate target, GGX/Cook–Torrance shading,
-  Fresnel, rough-metal environment approximation, directional key and four
-  local lights, 2048² PCF shadows, depth-based contact shading, restrained
-  bloom, lightweight edge smoothing, ACES tone mapping and sRGB output.
-- **Materials:** seamless colour/roughness and normal atlases, mip chains and
-  anisotropic filtering for concrete, timber, steel, chipped paint, rubber,
-  brick and safety stripes.
-- **Props:** bevelled silhouettes, crates assembled from individual boards,
-  nails, corner protectors and shipping labels; profiled drums with rolled
-  rims, reinforcing ribs and caps; slatted pallets with compound collision;
-  jerry cans with handles and pressed ribs; domino pips and traffic cones.
-- **Lab:** poured-concrete slabs, steel columns and triangulated trusses,
-  skylight opening, hanging lamps, loading door, ventilation, conduits,
-  braced shelving, cargo deck, complete safety railing and ramp.
-- **Hands/tool:** one camera-space rig for the tool and wrists, 56 cm GLB
-  scale, adult-sized palms and three-joint fingers, grip poses, elbow IK,
-  tapered sleeves and cuffs. Separate 62° viewmodel projection keeps weapon
-  proportions stable while the world FOV changes; its own depth buffer
-  prevents walls from cutting through it. Sway, breathing, walk bob, grip
-  tightening and recoil move the whole assembly together.
-- **Interaction:** 60 Hz fixed physics, CCD, sleeping, capsule player,
-  jumping, spring grab, collision filtering while held, throw/shove,
-  distance adjustment, reset, bounded spawning and slow motion.
-- **Sound/UI:** spatial, bounded 32-voice float mixer with loudness-following
-  HDR gain, soft limiter and slow-motion filtering; existing WAV effects;
-  Cyrillic-capable scalable UI, menu, pause, HUD and live settings.
-
-The environment reflection and contact shading are lightweight approximations;
-the renderer does not claim ray tracing, full GI or production PBR assets.
+- **Rust workspace:** reusable engine library (`void-engine`) and game binary
+  (`void-demo`) with pinned `Cargo.lock`; `wgpu` for native DX12/Vulkan, `winit`
+  for input/windowing, Rapier 3D for physics and `rodio` for spatial audio.
+- **Deferred PBR rendering:** 3-target MRT G-Buffer (`Rgba8UnormSrgb` albedo +
+  metallic, `Rgba16Float` world normals + roughness, `Rgba16Float` emissive)
+  with `Depth32Float` world-position reconstruction, Cook–Torrance GGX shading,
+  normal-aware 12-sample SSAO, HDR bloom, edge AA, ACES tonemapping and vignette.
+- **Shadows:** 4096² directional sun/moon shadow map with 16-tap rotated Poisson
+  PCF, plus 512²×6 omnidirectional shadow cube arrays (`D2Array`, up to 8 point
+  lights) with 8-tap rotated Poisson PCF and normal-offset bias.
+- **Dynamic Sun & Day/Night Cycle:** dedicated **УПРАВЛЕНИЕ СОЛНЦЕМ** submenu
+  from the main or pause menu with live time-of-day (`00:00`–`24:00`), azimuth
+  and orbit-tilt sliders, Dawn/Day/Sunset/Night presets, optional real-time cycle,
+  atmospheric sunset glow, procedural twinkling stars and cool moonlight.
+- **Dev-Textured Lighting Test Room (`40×40 m`):** world-scale tiled `Grid_4x4`
+  CC0 dev textures (`Gray`, `GrayInverted`, `Orange`, `OrangeInverted`) with
+  tangent normal and roughness maps, bevelled cubes, overhang arch, shaded
+  corner alcove, stepped blocks, PBR roughness/metallic calibration row and 6
+  interactive colored point lights draggable in-world via `E`.
+- **UI & Audio:** minimal HUD (FPS sparkline + orange controls hint), `egui`
+  menu/pause/settings/sun overlays, and a 32-voice spatial HDR audio mixer.
 
 ## Controls
 
 | Input | Action |
 | --- | --- |
-| WASD / Shift / Space | Move / sprint / jump |
+| `WASD` / `Shift` / `Space` | Move / sprint / jump |
 | Mouse | Look |
-| Hold LMB | Grab; release to drop |
-| RMB or F | Shove / throw |
-| Wheel | Hold distance |
-| 1–7 | Spawn crate, drum, steel ball, plank, brick, jerry can, domino |
-| G | Spawn a varied prop |
-| R / Q / M | Reset / slow motion ×0.28 / mute |
-| [ / ] | World FOV |
-| , / . | Eye height |
-| F3 / Esc | Settings / pause |
+| `E` | Grab / place targeted point light |
+| Mouse Wheel | Adjust held light distance (`1.2–12.0 m`) |
+| `R` / `Q` / `M` | Reset position & lights / slow motion ×0.28 / mute |
+| `H` | Toggle controls hint |
+| `[` / `]` | World FOV |
+| `,` / `.` | Eye height |
+| `F3` / `Esc` | Settings / pause |
 
 ## Verification and captures
 
@@ -93,65 +79,53 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo run --release --locked -p void-demo -- --selftest
 
-# GPU validation, deterministic camera, automatic exit and PNG readback:
-.\target\release\void_demo.exe --rhi=dx12 --autostart --smoke=90 --screenshot=docs/rust-game.png
-.\target\release\void_demo.exe --rhi=vulkan --showcase --smoke=90 --screenshot=docs/rust-grab.png
-.\target\release\void_demo.exe --rhi=dx12 --benchmark=300 --novsync
+# GPU smoke captures and benchmark:
+.\build\bin\Release\void_demo.exe --showcase --time=13.5 --smoke=35 --screenshot=docs/rust-game.png
+.\build\bin\Release\void_demo.exe --showcase --time=23.0 --smoke=35 --screenshot=docs/rust-night.png
+.\build\bin\Release\void_demo.exe --sun --time=17.65 --smoke=35 --screenshot=docs/rust-sun.png
+.\build\bin\Release\void_demo.exe --benchmark=100
 ```
 
-`--selftest` checks gravity/settling, picking, spring movement, throwing and
-the shipped GLB/embedded texture without opening a window. Unit tests also
-cover collision-filter restoration, audio limiting/panning and IK bone lengths.
-`--smoke=N` renders N frames and exits; screenshots include the real GPU scene
-and UI. Benchmark output names the actual adapter and reports average FPS,
-1% low and p95 frame time after 30 warm-up frames.
+`--selftest` checks gravity/settling, picking, spring movement and throwing
+without opening a window. Unit tests cover audio limiting/panning, physics
+collision filtering, dev-texture atlas loading and `naga` WGSL validation of
+`gbuffer.wgsl`, `deferred.wgsl` and `post.wgsl`.
 
-Other flags: `--adapter=N`, `--width=N`, `--height=N`, `--fullscreen`,
-`--settings`, `--validation`, `--no-prompt`, `--help`. The graphics backend can
-be `dx12`, `vulkan` or `auto`; `auto` requests a high-performance adapter.
+Other flags: `--rhi=dx12|vulkan|auto`, `--adapter=N`, `--width=N`, `--height=N`,
+`--fullscreen`, `--autostart`, `--showcase`, `--settings`, `--sun`, `--time=H`,
+`--novsync`, `--validation`, `--no-prompt`, `--help`.
 
 ### Measured Rust build
 
-Short local runs on NVIDIA GeForce GTX 960M, 1600×900, VSync off, default
-graphics, 180 measured frames after 30 warm-up frames (2026-11-10):
+NVIDIA GeForce GTX 960M (Vulkan), `1600×900`, deferred PBR + 4K sun shadows +
+6×512²×6 omnidirectional point-light shadows + normal-aware SSAO, 100 measured
+frames after 30 warm-up frames (2026-11-21):
 
-| Backend | Average | 1% low | p95 frame time |
-| --- | ---: | ---: | ---: |
-| DX12 | 95.9 FPS | 47.5 FPS | 20.24 ms |
-| Vulkan | 140.7 FPS | 105.1 FPS | 8.56 ms |
-
-These short runs are a smoke/performance baseline, not a hardware-independent
-guarantee. The 833 visible mesh instances are grouped into GPU instanced batches.
-Both backends also completed PNG readback; Vulkan was checked with a held crate.
+- `60.1 FPS` average, `55.0 FPS` 1% low, `17.17 ms` p95 frame time (`36` draws).
 
 ## Architecture
 
 ```text
 crates/void-engine/src/
-  render.rs       wgpu device, GPU resources, HDR/shadow/viewmodel/post passes
-  mesh.rs         bevelled boxes, spheres, lathed profiles and segments
-  textures.rs     reproducible seamless colour/roughness + normal atlas
+  render.rs       wgpu device, G-Buffer/shadow/deferred/post passes & sun math
+  mesh.rs         bevelled boxes with world-scale tiled UVs, spheres, lathes
+  textures.rs     DevTextures PNG atlas loader (albedo + roughness + normal)
   glb.rs          static GLB scene/accessor/embedded-image loader
   physics.rs      Rapier world, groups, rays, spring and impact stream
-  scene.rs        reusable detailed prop assemblies and Physics Lab
+  scene.rs        40x40m dev-textured test room & draggable point lights
   audio.rs        spatial voices, HDR mixer, limiter and WAV loading
 crates/void-demo/src/
-  main.rs         event loop, player, interaction, particles, menu/HUD/settings
-  rig.rs          tool anchors, articulated gloves, arm IK and animation
+  main.rs         event loop, player, light grabbing (E), menu/HUD routing
+  ui.rs           minimal HUD, menu, settings and Sun/Day-Night control UI
   settings.rs     validated persisted TOML settings
 assets/shaders/
-  pbr.wgsl        native wgpu world/viewmodel and sun-shadow shaders
-  post.wgsl       depth contact shading, bloom and ACES
+  gbuffer.wgsl    MRT G-Buffer geometry + sun/point-light depth passes
+  deferred.wgsl   deferred GGX PBR, Poisson PCF shadows, SSAO, day/night sky
+  post.wgsl       HDR bloom, luma edge AA, ACES tonemapping and vignette
 ```
-
-Cargo is the project's build system. `tools/build-rust.ps1` packages the Rust
-executable and runtime assets into `build/bin/Release` (or `Debug` with `-Debug`).
 
 ## License and credits
 
 Proprietary source-available software, © 2026 **Mi5hlen (Михаил Однолетко)**.
 See [LICENSE](LICENSE) and [COMMERCIAL_LICENSING.md](COMMERCIAL_LICENSING.md).
-Third-party dependency notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-The author-supplied manipulator GLB and the generated MOSS sound effects are
-reused from the previous version; the Roboto license ships in `assets/fonts`.
-Inspired by the Half-Life 2 E3 2003 physics demonstration.
+Third-party dependency and asset notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

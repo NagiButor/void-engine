@@ -31,7 +31,7 @@ pub fn asset_dir() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         for dir in exe.ancestors().skip(1).take(5) {
             let assets = dir.join("assets");
-            if assets.join("models").is_dir() {
+            if assets.join("shaders").is_dir() {
                 return assets;
             }
         }
@@ -44,7 +44,14 @@ mod shader_tests {
     #[test]
     fn gpu_shaders_parse_and_validate() {
         for (name, source) in [
-            ("PBR", include_str!("../../../assets/shaders/pbr.wgsl")),
+            (
+                "gbuffer",
+                include_str!("../../../assets/shaders/gbuffer.wgsl"),
+            ),
+            (
+                "deferred",
+                include_str!("../../../assets/shaders/deferred.wgsl"),
+            ),
             ("post", include_str!("../../../assets/shaders/post.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(source)

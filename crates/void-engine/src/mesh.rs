@@ -35,6 +35,15 @@ impl MeshData {
 
 /// Rounded edges are geometry, so highlights and silhouettes survive close-ups.
 pub fn bevel_box(half: Vec3, radius: f32) -> MeshData {
+    bevel_box_with_uv(half, radius, None)
+}
+
+/// Beveled box with world-scale tiled UVs (`tile_meters` per 0..1 texture repeat) so faces never stretch.
+pub fn bevel_box_tiled(half: Vec3, radius: f32, tile_meters: f32) -> MeshData {
+    bevel_box_with_uv(half, radius, Some(tile_meters.max(0.001)))
+}
+
+fn bevel_box_with_uv(half: Vec3, radius: f32, tile_meters: Option<f32>) -> MeshData {
     let r = radius.max(0.00001).min(half.min_element() * 0.8);
     let core = half - Vec3::splat(r);
     let mut mesh = MeshData::default();
@@ -57,10 +66,14 @@ pub fn bevel_box(half: Vec3, radius: f32) -> MeshData {
                 let p = n * hn + u * x + v * y;
                 let q = p.clamp(-core, core);
                 let normal = (p - q).normalize();
+                let uv = match tile_meters {
+                    Some(tile) => [(x + hu) / tile, (hv - y) / tile],
+                    None => [x / hu * 0.5 + 0.5, 0.5 - y / hv * 0.5],
+                };
                 mesh.vertices.push(Vertex {
                     position: (q + normal * r).to_array(),
                     normal: normal.to_array(),
-                    uv: [x / hu * 0.5 + 0.5, 0.5 - y / hv * 0.5],
+                    uv,
                 });
             }
         }

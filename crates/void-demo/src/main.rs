@@ -1,11 +1,11 @@
-mod rig;
 mod settings;
+mod ui;
 
 use anyhow::{Context, Result};
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Quat, Vec2, Vec3};
 use settings::Settings;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,19 +13,22 @@ use std::{
     },
     time::Instant,
 };
+use ui::{HudSnapshot, ScreenState, SettingsTab, SunState};
 use void_engine::{
     audio::Audio,
     physics::{self, FIXED_DT},
-    render::{Camera, Draw, Material, Renderer},
-    scene::{Lab, PropKind},
+    render::{Camera, Draw, Renderer},
+    scene::{self, Scene},
 };
 use winit::{
     dpi::PhysicalSize,
-    event::{DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, ElementState, Event, MouseScrollDelta, WindowEvent},
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowBuilder},
 };
+
+const SPARKLINE_SAMPLES: usize = 64;
 
 #[derive(Default)]
 struct Options {
@@ -34,6 +37,7 @@ struct Options {
     autostart: bool,
     showcase: bool,
     settings: bool,
+    sun: bool,
     smoke: u32,
     benchmark: u32,
     screenshot: Option<PathBuf>,
@@ -41,6 +45,7 @@ struct Options {
     fullscreen: bool,
     selftest: bool,
 }
+
 impl Options {
     fn parse(s: &mut Settings) -> Result<Self> {
         let mut o = Self::default();
@@ -63,6 +68,8 @@ impl Options {
                 o.autostart = true;
             } else if let Some(v) = arg.strip_prefix("--screenshot=") {
                 o.screenshot = Some(v.into());
+            } else if let Some(v) = arg.strip_prefix("--time=") {
+                s.time_of_day = v.parse::<f32>()?.rem_euclid(24.0);
             } else {
                 match arg.as_str() {
                     "--autostart" => o.autostart = true,
@@ -71,13 +78,14 @@ impl Options {
                         o.autostart = true;
                     }
                     "--settings" => o.settings = true,
+                    "--sun" => o.sun = true,
                     "--novsync" => s.vsync = false,
                     "--fullscreen" => o.fullscreen = true,
                     "--selftest" => o.selftest = true,
                     "--validation" => o.validation = true,
                     "--no-prompt" => {}
                     "--help" | "-h" => {
-                        println!("V.O.I.D. Rust Physics Lab\n--rhi=dx12|vulkan|auto --adapter=N --autostart --showcase --settings\n--width=1600 --height=900 --novsync --fullscreen --validation\n--smoke=N --benchmark=N --screenshot=path.png --selftest");
+                        println!("V.O.I.D. Engine\n--rhi=dx12|vulkan|auto --adapter=N --autostart --showcase --settings\n--width=1600 --height=900 --novsync --fullscreen --validation\n--smoke=N --benchmark=N --screenshot=path.png --selftest");
                         std::process::exit(0);
                     }
                     _ => anyhow::bail!("Unknown option {arg}"),
@@ -88,56 +96,41 @@ impl Options {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum State {
-    Menu,
-    Playing,
-    Paused,
-    Settings,
-}
-struct Spark {
-    p: Vec3,
-    v: Vec3,
-    life: f32,
-}
 struct Game {
     window: Arc<Window>,
     renderer: Renderer,
-    lab: Lab,
-    rig: rig::Rig,
+    scene: Scene,
     audio: Audio,
     camera: Camera,
     options: Options,
     settings: Settings,
-    state: State,
-    return_state: State,
+    state: ScreenState,
+    return_state: ScreenState,
+    settings_tab: SettingsTab,
+    sun: SunState,
     keys: HashSet<KeyCode>,
     look: Vec2,
-    held: Option<rapier_handle::Handle>,
-    hover: Option<rapier_handle::Handle>,
-    hold_distance: f32,
     slow: bool,
     accumulator: f32,
     time: f32,
     last: Instant,
     frames: u32,
     frame_times: Vec<f32>,
+    recent_ms: VecDeque<f32>,
     fps: f32,
+    player_speed: f32,
+    player_pos: Vec3,
+    grounded: bool,
+    hovered_light: Option<usize>,
+    held_light: Option<usize>,
+    hold_dist: f32,
+    show_controls: bool,
     egui: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
-    sparks: Vec<Spark>,
-    impact_cooldown: f32,
     footstep: f32,
-    toast: String,
-    toast_timer: f32,
-    keep_held: bool,
     exit: bool,
     focused: bool,
-}
-// Re-export the public handle through the engine so the game does not depend on physics internals.
-mod rapier_handle {
-    pub type Handle = void_engine::scene::BodyHandle;
 }
 
 impl Game {
@@ -145,15 +138,14 @@ impl Game {
         let assets = void_engine::asset_dir();
         let mut renderer = Renderer::new(
             window.clone(),
+            &assets,
             &options.backend,
             options.adapter,
-            &assets,
             settings.vsync,
             options.validation,
         )
         .await?;
-        let lab = Lab::new(&mut renderer)?;
-        let rig = rig::Rig::new(&mut renderer);
+        let scene = Scene::new(&mut renderer)?;
         let audio = Audio::new(&assets);
         let ctx = egui::Context::default();
         let mut fonts = egui::FontDefinitions::default();
@@ -166,12 +158,13 @@ impl Game {
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
             .insert(0, "Roboto".into());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .insert(0, "Roboto".into());
         ctx.set_fonts(fonts);
-        let mut style = (*ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.selection.bg_fill = egui::Color32::from_rgb(176, 111, 37);
-        style.spacing.item_spacing = egui::vec2(12.0, 10.0);
-        ctx.set_style(style);
+        ui::apply_theme(&ctx);
         let egui_state = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -184,35 +177,36 @@ impl Game {
         let mut g = Self {
             window,
             renderer,
-            lab,
-            rig,
+            scene,
             audio,
             camera: Camera::default(),
             options,
             settings,
-            state: State::Menu,
-            return_state: State::Menu,
+            state: ScreenState::Menu,
+            return_state: ScreenState::Menu,
+            settings_tab: SettingsTab::Graphics,
+            sun: SunState::default(),
             keys: HashSet::new(),
             look: Vec2::ZERO,
-            held: None,
-            hover: None,
-            hold_distance: 2.5,
             slow: false,
             accumulator: 0.0,
             time: 0.0,
             last: Instant::now(),
             frames: 0,
             frame_times: Vec::new(),
+            recent_ms: VecDeque::with_capacity(SPARKLINE_SAMPLES),
             fps: 60.0,
+            player_speed: 0.0,
+            player_pos: scene::SPAWN,
+            grounded: true,
+            hovered_light: None,
+            held_light: None,
+            hold_dist: 3.5,
+            show_controls: true,
             egui: ctx,
             egui_state,
             egui_renderer,
-            sparks: Vec::new(),
-            impact_cooldown: 0.0,
             footstep: 0.0,
-            toast: "СЕКТОР 07 // СИСТЕМЫ ГОТОВЫ".into(),
-            toast_timer: 3.0,
-            keep_held: false,
             exit: false,
             focused: true,
         };
@@ -225,8 +219,12 @@ impl Game {
         if g.options.settings {
             g.open_settings();
         }
+        if g.options.sun {
+            g.open_sun();
+        }
         Ok(g)
     }
+
     fn capture_mouse(&self, on: bool) {
         if self.options.smoke > 0 || self.options.benchmark > 0 {
             return;
@@ -240,8 +238,9 @@ impl Game {
         }
         self.window.set_cursor_visible(!on);
     }
+
     fn start(&mut self) {
-        self.state = State::Playing;
+        self.state = ScreenState::Playing;
         self.camera = Camera {
             fov: self.settings.fov,
             ..Default::default()
@@ -249,155 +248,83 @@ impl Game {
         self.capture_mouse(true);
         self.accumulator = 0.0;
     }
+
+    fn resume(&mut self) {
+        self.state = ScreenState::Playing;
+        self.capture_mouse(true);
+        self.accumulator = 0.0;
+    }
+
     fn pause(&mut self) {
-        if self.state == State::Playing {
-            self.drop(false);
-            self.state = State::Paused;
+        if self.state == ScreenState::Playing {
+            self.state = ScreenState::Paused;
             self.capture_mouse(false);
             self.keys.clear();
             self.look = Vec2::ZERO;
         }
     }
+
+    fn open_menu(&mut self) {
+        self.state = ScreenState::Menu;
+        self.capture_mouse(false);
+        self.keys.clear();
+        self.look = Vec2::ZERO;
+    }
+
     fn open_settings(&mut self) {
         self.return_state = self.state;
-        if self.state == State::Playing {
+        if self.state == ScreenState::Playing {
             self.pause();
         }
-        self.state = State::Settings;
+        self.state = ScreenState::Settings;
         self.capture_mouse(false);
     }
+
     fn close_settings(&mut self) {
         self.settings.save();
         self.state = self.return_state;
-        self.capture_mouse(self.state == State::Playing);
+        self.capture_mouse(self.state == ScreenState::Playing);
     }
+
+    fn open_sun(&mut self) {
+        self.return_state = if self.state == ScreenState::Playing {
+            self.pause();
+            ScreenState::Paused
+        } else {
+            self.state
+        };
+        self.state = ScreenState::Sun;
+        self.capture_mouse(false);
+    }
+
+    fn close_sun(&mut self) {
+        self.settings.save();
+        self.state = self.return_state;
+        self.capture_mouse(self.state == ScreenState::Playing);
+    }
+
     fn reset(&mut self) {
-        self.drop(false);
-        self.lab.reset();
+        self.scene.reset();
+        self.held_light = None;
+        self.hovered_light = None;
         self.camera = Camera {
             fov: self.settings.fov,
             ..Default::default()
         };
-        self.keep_held = false;
-        self.sparks.clear();
-        self.toast = "СЦЕНА ВОССТАНОВЛЕНА".into();
-        self.toast_timer = 2.0;
+        self.player_pos = scene::SPAWN;
+        self.player_speed = 0.0;
     }
+
     fn showcase(&mut self) {
-        self.lab.physics.bodies[self.lab.player]
-            .set_translation(physics::vector(Vec3::new(3.0, 0.81, 6.8)), true);
-        self.camera.position = Vec3::new(3.0, 1.66, 6.8);
-        self.camera.pitch = -0.23;
-        self.lab.physics.refresh_queries();
-        self.update_hover();
-        self.grab();
-        self.keep_held = true;
+        let p = Vec3::new(2.2, 0.81, 8.8);
+        self.scene.physics.bodies[self.scene.player].set_translation(physics::vector(p), true);
+        self.player_pos = p;
+        self.camera.position = p + Vec3::Y * self.settings.eye_height;
+        self.camera.yaw = 0.18;
+        self.camera.pitch = -0.09;
+        self.scene.physics.refresh_queries();
     }
-    fn update_hover(&mut self) {
-        self.hover = self
-            .lab
-            .physics
-            .raycast(
-                self.camera.position,
-                self.camera.forward(),
-                7.0,
-                self.lab.player,
-                false,
-            )
-            .map(|(h, _)| h)
-            .filter(|h| self.lab.props.iter().any(|p| p.body == *h));
-    }
-    fn burst(&mut self, p: Vec3) {
-        for i in 0..18 {
-            let a = i as f32 * 2.39996 + self.time;
-            let v = Vec3::new(a.cos(), 0.3 + (i % 4) as f32 * 0.25, a.sin())
-                * (0.6 + (i % 5) as f32 * 0.3);
-            self.sparks.push(Spark {
-                p,
-                v,
-                life: 0.35 + (i % 4) as f32 * 0.07,
-            });
-        }
-        if self.sparks.len() > 150 {
-            self.sparks.drain(..self.sparks.len() - 150);
-        }
-    }
-    fn grab(&mut self) {
-        if self.held.is_some() {
-            return;
-        }
-        if let Some(h) = self.hover {
-            self.held = Some(h);
-            self.hold_distance = (physics::vec3(self.lab.physics.bodies[h].translation())
-                - self.camera.position)
-                .length()
-                .clamp(1.4, 5.0);
-            self.lab.physics.hold_filter(h, true);
-            self.audio.play("grab", None, 0.65);
-            let p = physics::vec3(self.lab.physics.bodies[h].translation());
-            self.burst(p);
-        }
-    }
-    fn drop(&mut self, throw: bool) {
-        if let Some(h) = self.held.take() {
-            self.lab.physics.release(
-                h,
-                if throw {
-                    Some(self.camera.forward() * 17.0 + Vec3::Y * 1.6)
-                } else {
-                    None
-                },
-            );
-            if throw {
-                self.rig.recoil();
-                self.audio.play("throw", None, 0.8);
-                let p = physics::vec3(self.lab.physics.bodies[h].translation());
-                self.burst(p);
-            }
-        }
-    }
-    fn shove(&mut self) {
-        if self.held.is_some() {
-            self.drop(true);
-        } else if let Some(h) = self.hover {
-            let b = &mut self.lab.physics.bodies[h];
-            b.apply_impulse(
-                physics::vector(self.camera.forward() * b.mass() * 8.0),
-                true,
-            );
-            self.rig.recoil();
-            self.audio.play("throw", None, 0.5);
-        }
-    }
-    fn spawn(&mut self, kind: PropKind) {
-        let spawned = self.lab.props.iter().filter(|p| !p.initial).count();
-        if spawned >= 34 {
-            if let Some(i) = self
-                .lab
-                .props
-                .iter()
-                .position(|p| !p.initial && Some(p.body) != self.held)
-            {
-                let p = self.lab.props.remove(i);
-                self.lab.physics.remove(p.body);
-            }
-        }
-        let ray = self.lab.physics.raycast(
-            self.camera.position,
-            self.camera.forward(),
-            3.5,
-            self.lab.player,
-            false,
-        );
-        let distance = ray.map(|(_, d)| (d - 0.85).max(1.3)).unwrap_or(3.5);
-        let p = self.camera.position + self.camera.forward() * distance + Vec3::Y * 0.25;
-        self.lab
-            .spawn(kind, p, Quat::from_rotation_y(self.camera.yaw), false);
-        self.audio.play("spawn", Some(p), 0.5);
-        self.burst(p);
-        self.toast = format!("{} // СОЗДАН", kind.name().to_uppercase());
-        self.toast_timer = 1.6;
-    }
+
     fn key(&mut self, key: KeyCode, down: bool, repeat: bool) {
         if down {
             self.keys.insert(key);
@@ -409,33 +336,43 @@ impl Game {
         }
         if key == KeyCode::Escape {
             match self.state {
-                State::Playing => self.pause(),
-                State::Paused => {
-                    self.state = State::Playing;
-                    self.capture_mouse(true);
-                }
-                State::Settings => self.close_settings(),
-                State::Menu => self.exit = true,
+                ScreenState::Playing => self.pause(),
+                ScreenState::Paused => self.resume(),
+                ScreenState::Settings => self.close_settings(),
+                ScreenState::Sun => self.close_sun(),
+                ScreenState::Menu => self.exit = true,
             }
             return;
         }
         if key == KeyCode::F3 {
-            if self.state == State::Settings {
+            if self.state == ScreenState::Settings {
                 self.close_settings();
             } else {
                 self.open_settings();
             }
             return;
         }
-        if self.state == State::Menu && key == KeyCode::Enter {
+        if self.state == ScreenState::Menu && key == KeyCode::Enter {
             self.start();
             return;
         }
-        if self.state != State::Playing {
+        if self.state != ScreenState::Playing {
             return;
         }
         match key {
-            KeyCode::KeyF => self.drop(true),
+            KeyCode::KeyE => {
+                if self.held_light.take().is_some() {
+                    self.audio.play("ui_click", None, 0.35);
+                } else if let Some((idx, dist)) =
+                    self.scene
+                        .pick_light(self.camera.position, self.camera.forward(), 14.0)
+                {
+                    self.held_light = Some(idx);
+                    self.hold_dist = dist.clamp(1.4, 10.0);
+                    self.hovered_light = None;
+                    self.audio.play("grab", None, 0.45);
+                }
+            }
             KeyCode::KeyR => self.reset(),
             KeyCode::KeyQ => {
                 self.slow = !self.slow;
@@ -445,15 +382,12 @@ impl Game {
                     0.5,
                 );
             }
-            KeyCode::KeyM => self.settings.muted = !self.settings.muted,
-            KeyCode::KeyG => self.spawn(PropKind::ALL[(self.frames as usize * 7) % 10]),
-            KeyCode::Digit1 => self.spawn(PropKind::Crate),
-            KeyCode::Digit2 => self.spawn(PropKind::Barrel),
-            KeyCode::Digit3 => self.spawn(PropKind::Sphere),
-            KeyCode::Digit4 => self.spawn(PropKind::Plank),
-            KeyCode::Digit5 => self.spawn(PropKind::Brick),
-            KeyCode::Digit6 => self.spawn(PropKind::Can),
-            KeyCode::Digit7 => self.spawn(PropKind::Domino),
+            KeyCode::KeyM => {
+                self.settings.muted = !self.settings.muted;
+            }
+            KeyCode::KeyH => {
+                self.show_controls = !self.show_controls;
+            }
             KeyCode::BracketLeft => self.settings.fov = (self.settings.fov - 1.0).max(65.0),
             KeyCode::BracketRight => self.settings.fov = (self.settings.fov + 1.0).min(110.0),
             KeyCode::Comma => {
@@ -465,9 +399,13 @@ impl Game {
             _ => {}
         }
     }
+
     fn update(&mut self, dt: f32) {
         self.time += dt;
-        self.toast_timer -= dt;
+        if self.sun.auto_cycle {
+            self.settings.time_of_day =
+                (self.settings.time_of_day + dt * self.sun.cycle_speed).rem_euclid(24.0);
+        }
         self.camera.fov = self.settings.fov;
         self.audio.settings(
             if self.settings.muted {
@@ -478,7 +416,7 @@ impl Game {
             self.settings.hdr_audio,
             self.slow,
         );
-        if self.state == State::Playing {
+        if self.state == ScreenState::Playing {
             self.camera.yaw -= self.look.x * 0.002 * self.settings.sensitivity;
             self.camera.pitch = (self.camera.pitch
                 - self.look.y * 0.002 * self.settings.sensitivity)
@@ -502,13 +440,14 @@ impl Game {
                 4.2
             };
             let velocity = wish.normalize_or_zero() * speed;
-            let p = physics::vec3(self.lab.physics.bodies[self.lab.player].translation());
+            let p = physics::vec3(self.scene.physics.bodies[self.scene.player].translation());
             let grounded = self
-                .lab
+                .scene
                 .physics
-                .raycast(p, -Vec3::Y, 0.87, self.lab.player, false)
+                .raycast(p, -Vec3::Y, 0.87, self.scene.player, false)
                 .is_some();
-            let b = &mut self.lab.physics.bodies[self.lab.player];
+            self.grounded = grounded;
+            let b = &mut self.scene.physics.bodies[self.scene.player];
             let mut v = physics::vec3(b.linvel());
             let blend = 1.0 - (-if grounded { 22.0 } else { 6.0 } * dt).exp();
             v.x += (velocity.x - v.x) * blend;
@@ -519,471 +458,106 @@ impl Game {
             b.set_linvel(physics::vector(v), true);
             self.accumulator += (dt * if self.slow { 0.28 } else { 1.0 }).min(0.1);
             while self.accumulator >= FIXED_DT {
-                if let Some(h) = self.held {
-                    self.lab.physics.spring(
-                        h,
-                        self.camera.position + self.camera.forward() * self.hold_distance,
-                    );
-                }
-                self.lab.physics.step(FIXED_DT);
+                self.scene.physics.step(FIXED_DT);
                 self.accumulator -= FIXED_DT;
-                self.impact_cooldown -= FIXED_DT;
-                if self.impact_cooldown <= 0.0 {
-                    if let Some(&(tag, p, impulse)) = self
-                        .lab
-                        .physics
-                        .impacts
-                        .iter()
-                        .max_by(|a, b| a.2.total_cmp(&b.2))
-                    {
-                        if let Some(prop) = self
-                            .lab
-                            .props
-                            .iter()
-                            .find(|prop| self.lab.physics.bodies[prop.body].user_data == tag)
-                        {
-                            self.audio.play(
-                                prop.kind.sound(),
-                                Some(p),
-                                (impulse / 120.0).clamp(0.03, 0.75),
-                            );
-                            self.impact_cooldown = 0.07;
-                        }
-                    }
-                }
             }
-            let p = physics::vec3(self.lab.physics.bodies[self.lab.player].translation());
+            let p = physics::vec3(self.scene.physics.bodies[self.scene.player].translation());
             if p.y < -10.0 {
                 self.reset();
+            } else {
+                self.player_pos = p;
             }
-            self.camera.position =
-                p + Vec3::Y * self.settings.eye_height + right * self.settings.camera_side;
+            self.player_speed = v.xz_length();
+            self.camera.position = self.player_pos
+                + Vec3::Y * self.settings.eye_height
+                + right * self.settings.camera_side;
             if self.settings.head_bob && grounded && wish.length_squared() > 0.0 {
                 self.camera.position.y += (self.time * speed * 2.6).sin() * 0.006;
             }
-            self.update_hover();
-            self.rig.update(
-                dt,
-                self.time,
-                self.look,
-                v.xz_length(),
-                self.held.is_some(),
-                self.settings.head_bob,
-            );
             self.footstep -= dt;
-            if grounded && v.xz_length() > 1.0 && self.footstep <= 0.0 {
+            if grounded && self.player_speed > 1.0 && self.footstep <= 0.0 {
                 self.audio.play(
                     if self.frames.is_multiple_of(2) {
                         "footstep_1"
                     } else {
                         "footstep_2"
                     },
-                    Some(p - Vec3::Y * 0.8),
+                    Some(self.player_pos - Vec3::Y * 0.8),
                     0.25,
                 );
-                self.footstep = 2.0 / v.xz_length();
+                self.footstep = 2.0 / self.player_speed;
             }
-        } else if self.state == State::Menu {
-            self.camera.position = Vec3::new(7.5 + (self.time * 0.08).sin() * 0.3, 3.5, 10.8);
-            let dir = (Vec3::new(0.0, 1.0, -2.0) - self.camera.position).normalize();
+            if let Some(idx) = self.held_light {
+                let target = self.scene.clamp_light_target(
+                    self.camera.position,
+                    self.camera.forward(),
+                    self.hold_dist,
+                );
+                let alpha = 1.0 - (-18.0 * dt).exp();
+                self.scene.lights[idx].pos = self.scene.lights[idx].pos.lerp(target, alpha);
+                self.hovered_light = None;
+            } else {
+                self.hovered_light = self
+                    .scene
+                    .pick_light(self.camera.position, self.camera.forward(), 14.0)
+                    .map(|(i, _)| i);
+            }
+        } else if self.state == ScreenState::Menu
+            || (self.state == ScreenState::Sun && self.return_state == ScreenState::Menu)
+        {
+            self.hovered_light = None;
+            self.camera.position = Vec3::new(9.5 + (self.time * 0.08).sin() * 0.35, 4.6, 12.8);
+            let dir = (Vec3::new(-1.2, 1.3, -2.5) - self.camera.position).normalize();
             self.camera.yaw = (-dir.x).atan2(-dir.z);
             self.camera.pitch = dir.y.asin();
             self.camera.fov = 66.0;
         }
-        for spark in &mut self.sparks {
-            spark.life -= dt;
-            spark.v.y -= 6.0 * dt;
-            spark.p += spark.v * dt;
-        }
-        self.sparks.retain(|s| s.life > 0.0);
         self.audio.listener = self.camera.position;
         self.audio.right = self.camera.right();
         self.look = Vec2::ZERO;
     }
+
     fn scene_draws(&self) -> Vec<Draw> {
-        let mut draws = self.lab.draws();
-        if self.state == State::Playing {
-            self.rig.draw(&mut draws, &self.camera, self.lab.tool);
-            if let Some(h) = self.held {
-                let end = physics::vec3(self.lab.physics.bodies[h].translation());
-                let start = self.rig.emitter(&self.camera);
-                let delta = end - start;
-                for i in 0..14 {
-                    let t0 = i as f32 / 14.0;
-                    let t1 = (i + 1) as f32 / 14.0;
-                    let wave = |t: f32| {
-                        self.camera.right()
-                            * (t * std::f32::consts::PI).sin()
-                            * (t * 28.0 - self.time * 18.0).sin()
-                            * 0.014
-                    };
-                    let a = start + delta * t0 + wave(t0);
-                    let b = start + delta * t1 + wave(t1);
-                    let d = b - a;
-                    let mut draw = Draw::new(
-                        self.lab.cylinder,
-                        Mat4::from_scale_rotation_translation(
-                            Vec3::new(0.006, d.length(), 0.006),
-                            Quat::from_rotation_arc(Vec3::Y, d.normalize()),
-                            (a + b) * 0.5,
-                        ),
-                        Material::glow([1.0, 0.48, 0.11], 5.5),
-                    );
-                    draw.shadow = false;
-                    draws.push(draw);
-                }
-                for i in 0..8 {
-                    let angle = self.time * 1.2 + i as f32 * std::f32::consts::TAU / 8.0;
-                    let p = end + Vec3::new(angle.cos() * 0.58, angle.sin() * 0.58, 0.0);
-                    let mut d = Draw::new(
-                        self.lab.sphere,
-                        Mat4::from_scale_rotation_translation(
-                            Vec3::splat(0.012),
-                            Quat::IDENTITY,
-                            p,
-                        ),
-                        Material::glow([1.0, 0.52, 0.16], 3.5),
-                    );
-                    d.shadow = false;
-                    draws.push(d);
-                }
-            }
-        }
-        for s in &self.sparks {
-            let mut d = Draw::new(
-                self.lab.sphere,
-                Mat4::from_scale_rotation_translation(
-                    Vec3::splat(0.008 * s.life.min(0.2) / 0.2),
-                    Quat::IDENTITY,
-                    s.p,
-                ),
-                Material::glow([1.0, 0.55, 0.17], 4.0),
-            );
-            d.shadow = false;
-            draws.push(d);
-        }
-        draws
+        self.scene.draws(self.hovered_light, self.held_light)
     }
+
     fn ui(&mut self, ctx: &egui::Context) {
-        let amber = egui::Color32::from_rgb(229, 167, 76);
-        let muted = egui::Color32::from_gray(175);
-        let rect = ctx.screen_rect();
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
-            egui::Id::new("world labels"),
-        ));
-        // Text decal projected from its real wall position.
-        let vp = Mat4::perspective_rh(
-            self.camera.fov.to_radians(),
-            rect.width() / rect.height(),
-            0.06,
-            120.0,
-        ) * self.camera.view();
-        let p = vp * Vec3::new(0.5, 4.7, -13.52).extend(1.0);
-        if p.w > 0.1 {
-            let ndc = p.truncate() / p.w;
-            let pos = rect.min
-                + egui::vec2(
-                    (ndc.x * 0.5 + 0.5) * rect.width(),
-                    (-ndc.y * 0.5 + 0.5) * rect.height(),
-                );
-            let size = (rect.height() * 1.8 / p.w).clamp(9.0, 80.0);
-            painter.text(
-                pos,
-                egui::Align2::CENTER_CENTER,
-                "V.O.I.D.  /  PHYSICS LAB",
-                egui::FontId::proportional(size * 0.32),
-                amber,
-            );
-            painter.text(
-                pos + egui::vec2(0.0, size * 0.42),
-                egui::Align2::CENTER_CENTER,
-                "SECTOR 07  ·  INTERACTIVE DYNAMICS",
-                egui::FontId::proportional(size * 0.15),
-                muted,
-            );
-        }
-        egui::Area::new("identity".into())
-            .fixed_pos(egui::pos2(24.0, 20.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("V.O.I.D.").size(22.0).color(amber));
-                    ui.add_space(14.0);
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("PHYSICS LAB").size(14.0));
-                        ui.label(
-                            egui::RichText::new("RUST RUNTIME / SECTOR 07")
-                                .size(10.0)
-                                .color(muted),
-                        );
-                    });
-                });
-            });
-        egui::Area::new("stats".into())
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 20.0))
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "{:.0} FPS   /   {} ОБЪЕКТОВ",
-                    self.fps,
-                    self.lab.props.len()
-                ));
-                ui.label(
-                    egui::RichText::new(&self.renderer.adapter_name)
-                        .size(10.0)
-                        .color(muted),
-                );
-                let (voices, gain) = self.audio.stats();
-                ui.label(
-                    egui::RichText::new(format!("HDR {gain:+.1} dB · {voices} voices"))
-                        .size(10.0)
-                        .color(muted),
-                );
-            });
-        match self.state {
-            State::Menu | State::Paused => {
-                let menu = self.state == State::Menu;
-                egui::Window::new(if menu {
-                    "V.O.I.D. / PHYSICS LAB"
-                } else {
-                    "ПАУЗА"
-                })
-                .title_bar(false)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::LEFT_CENTER, egui::vec2(72.0, 0.0))
-                .fixed_size(egui::vec2(340.0, 310.0))
-                .frame(
-                    egui::Frame::window(&ctx.style())
-                        .fill(egui::Color32::from_black_alpha(220))
-                        .inner_margin(28.0),
-                )
-                .show(ctx, |ui| {
-                    ui.label(
-                        egui::RichText::new("VIRTUAL OBJECTS &\nINTERACTIVE DYNAMICS")
-                            .size(13.0)
-                            .color(amber),
-                    );
-                    ui.add_space(16.0);
-                    ui.heading(if menu {
-                        "ФИЗИЧЕСКАЯ ЛАБОРАТОРИЯ"
-                    } else {
-                        "СИМУЛЯЦИЯ ПРИОСТАНОВЛЕНА"
-                    });
-                    ui.label("Нативный Rust · PBR · Rapier 3D");
-                    ui.add_space(22.0);
-                    if ui
-                        .add_sized(
-                            [280.0, 40.0],
-                            egui::Button::new(if menu {
-                                "НАЧАТЬ ЭКСПЕРИМЕНТ"
-                            } else {
-                                "ПРОДОЛЖИТЬ"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        if menu {
-                            self.start();
-                        } else {
-                            self.state = State::Playing;
-                            self.capture_mouse(true);
-                        }
-                    }
-                    if ui
-                        .add_sized([280.0, 36.0], egui::Button::new("НАСТРОЙКИ"))
-                        .clicked()
-                    {
-                        self.open_settings();
-                    }
-                    if ui
-                        .add_sized([280.0, 36.0], egui::Button::new("ВЫХОД"))
-                        .clicked()
-                    {
-                        self.exit = true;
-                    }
-                });
-            }
-            State::Playing => {
-                let p = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    "crosshair".into(),
-                ));
-                let center = rect.center();
-                let color = if self.hover.is_some() || self.held.is_some() {
-                    amber
-                } else {
-                    egui::Color32::from_white_alpha(180)
-                };
-                for (a, b) in [
-                    (egui::vec2(-7.0, 0.0), egui::vec2(-3.0, 0.0)),
-                    (egui::vec2(3.0, 0.0), egui::vec2(7.0, 0.0)),
-                    (egui::vec2(0.0, -7.0), egui::vec2(0.0, -3.0)),
-                    (egui::vec2(0.0, 3.0), egui::vec2(0.0, 7.0)),
-                ] {
-                    p.line_segment([center + a, center + b], egui::Stroke::new(1.2_f32, color));
-                }
-                if let Some(h) = self.held.or(self.hover) {
-                    if let Some(prop) = self.lab.props.iter().find(|p| p.body == h) {
-                        p.text(
-                            center + egui::vec2(0.0, 24.0),
-                            egui::Align2::CENTER_TOP,
-                            format!("{}  /  {:.1} кг", prop.kind.name(), prop.kind.mass()),
-                            egui::FontId::proportional(13.0),
-                            color,
-                        );
-                    }
-                }
-                egui::Area::new("controls".into()).anchor(egui::Align2::LEFT_BOTTOM,egui::vec2(24.0,-24.0)).show(ctx,|ui|{ui.label(egui::RichText::new("WASD  движение     SHIFT  бег     SPACE  прыжок\nЛКМ  захват     ПКМ / F  бросок     КОЛЕСО  дистанция\nR  сброс     Q  замедление     F3  настройки").size(11.0).color(egui::Color32::from_white_alpha(190)));});
-                egui::Area::new("hotbar".into())
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            for (i, kind) in PropKind::ALL[..7].iter().enumerate() {
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_black_alpha(160))
-                                    .inner_margin(8.0)
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} {}",
-                                                i + 1,
-                                                kind.name()
-                                            ))
-                                            .size(11.0)
-                                            .color(amber),
-                                        );
-                                    });
-                            }
-                        });
-                    });
-                if self.toast_timer > 0.0 {
-                    egui::Area::new("toast".into())
-                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -70.0))
-                        .show(ctx, |ui| {
-                            egui::Frame::none()
-                                .fill(egui::Color32::from_black_alpha(175))
-                                .inner_margin(10.0)
-                                .show(ui, |ui| {
-                                    ui.label(&self.toast);
-                                });
-                        });
-                }
-                if self.slow {
-                    p.text(
-                        egui::pos2(rect.center().x, 28.0),
-                        egui::Align2::CENTER_TOP,
-                        "ЗАМЕДЛЕНИЕ ×0.28",
-                        egui::FontId::proportional(14.0),
-                        amber,
-                    );
-                }
-            }
-            State::Settings => {
-                self.settings_ui(ctx);
-            }
-        }
-    }
-    fn settings_ui(&mut self, ctx: &egui::Context) {
         let old_vsync = self.settings.vsync;
         let old_size = (self.settings.width, self.settings.height);
-        egui::Window::new("НАСТРОЙКИ / V.O.I.D.")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .default_width(590.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(ctx.screen_rect().height() - 140.0)
-                    .show(ui, |ui| {
-                        ui.heading("Графика");
-                        egui::ComboBox::from_label("Разрешение")
-                            .selected_text(format!(
-                                "{} × {}",
-                                self.settings.width, self.settings.height
-                            ))
-                            .show_ui(ui, |ui| {
-                                for (w, h) in [(1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]
-                                {
-                                    if ui
-                                        .selectable_label(
-                                            (w, h) == (self.settings.width, self.settings.height),
-                                            format!("{w} × {h}"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.settings.width = w;
-                                        self.settings.height = h;
-                                    }
-                                }
-                            });
-                        ui.checkbox(&mut self.settings.vsync, "Вертикальная синхронизация");
-                        egui::ComboBox::from_label("Тени")
-                            .selected_text(
-                                ["Выкл", "Жёсткие", "Мягкие PCF"][self.settings.shadows as usize],
-                            )
-                            .show_ui(ui, |ui| {
-                                for (i, name) in
-                                    ["Выкл", "Жёсткие", "Мягкие PCF"].into_iter().enumerate()
-                                {
-                                    ui.selectable_value(&mut self.settings.shadows, i as u32, name);
-                                }
-                            });
-                        ui.checkbox(&mut self.settings.ao, "Контактное затенение (SSAO)");
-                        ui.checkbox(&mut self.settings.bloom, "Свечение (bloom)");
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.exposure, 0.5..=1.6)
-                                .text("Экспозиция"),
-                        );
-                        ui.add(egui::Slider::new(&mut self.settings.fog, 0.0..=2.0).text("Туман"));
-                        ui.separator();
-                        ui.heading("Камера");
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.fov, 65.0..=110.0)
-                                .text("FOV мира, °"),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Оружие: отдельная проекция {:.0}° · длина {:.0} см",
-                                rig::VIEW_FOV,
-                                rig::TOOL_LENGTH * 100.0
-                            ))
-                            .small(),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.eye_height, 0.70..=1.0)
-                                .text("Высота глаз над центром капсулы"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.camera_side, -0.2..=0.2)
-                                .text("Смещение камеры"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.sensitivity, 0.2..=3.0)
-                                .text("Чувствительность"),
-                        );
-                        ui.checkbox(&mut self.settings.head_bob, "Покачивание при ходьбе");
-                        ui.separator();
-                        ui.heading("Звук");
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.volume, 0.0..=1.0)
-                                .text("Громкость"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.hdr_audio, 0.0..=1.0)
-                                .text("HDR-аудио"),
-                        );
-                        ui.checkbox(&mut self.settings.muted, "Без звука");
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("СОХРАНИТЬ И НАЗАД").clicked() {
-                                self.close_settings();
-                            }
-                            if ui.button("СБРОСИТЬ НАСТРОЙКИ").clicked() {
-                                self.settings = Settings::default();
-                            }
-                        });
-                    });
-            });
+        let (audio_voices, audio_gain) = self.audio.stats();
+        let recent: Vec<f32> = self.recent_ms.iter().copied().collect();
+
+        let actions = {
+            let snap = HudSnapshot {
+                state: self.state,
+                fps: self.fps,
+                recent_ms: &recent,
+                adapter: &self.renderer.adapter_name,
+                audio_voices,
+                audio_gain,
+                slow: self.slow,
+                speed: self.player_speed,
+                grounded: self.grounded,
+                time: self.time,
+                light_hovered: self.hovered_light.is_some(),
+                light_held: self.held_light.is_some(),
+                show_controls: self.show_controls,
+            };
+            ui::render(
+                ctx,
+                &snap,
+                &mut self.settings,
+                &mut self.settings_tab,
+                &mut self.sun,
+            )
+        };
+
+        if actions.click_sfx {
+            self.audio.play("ui_click", None, 0.35);
+        }
+        if actions.reset_settings {
+            self.settings = Settings::default();
+        }
         if self.settings.vsync != old_vsync {
             self.renderer.vsync(self.settings.vsync);
         }
@@ -992,7 +566,43 @@ impl Game {
                 .window
                 .request_inner_size(PhysicalSize::new(self.settings.width, self.settings.height));
         }
+        if actions.start {
+            self.start();
+        }
+        if actions.resume {
+            self.resume();
+        }
+        if actions.reset_scene {
+            self.reset();
+            self.resume();
+        }
+        if actions.open_settings {
+            self.open_settings();
+        }
+        if actions.close_settings {
+            self.close_settings();
+        }
+        if actions.open_sun {
+            self.open_sun();
+        }
+        if actions.close_sun {
+            self.close_sun();
+        }
+        if actions.reset_sun {
+            let defaults = Settings::default();
+            self.settings.time_of_day = defaults.time_of_day;
+            self.settings.sun_azimuth = defaults.sun_azimuth;
+            self.settings.sun_tilt = defaults.sun_tilt;
+            self.sun = SunState::default();
+        }
+        if actions.to_menu {
+            self.open_menu();
+        }
+        if actions.exit {
+            self.exit = true;
+        }
     }
+
     fn frame(&mut self) -> Result<()> {
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -1001,7 +611,13 @@ impl Game {
         let now = Instant::now();
         let raw = now.duration_since(self.last).as_secs_f32();
         self.last = now;
+        let ms = raw * 1000.0;
         self.fps += (1.0 / raw.max(0.0001) - self.fps) * 0.04;
+        if self.recent_ms.len() >= SPARKLINE_SAMPLES {
+            self.recent_ms.pop_front();
+        }
+        self.recent_ms.push_back(ms.clamp(0.5, 60.0));
+
         self.update(if self.options.smoke > 0 {
             FIXED_DT
         } else {
@@ -1050,11 +666,13 @@ impl Game {
             &screen,
         );
         let draws = self.scene_draws();
+        let lights = self.scene.render_lights();
         self.renderer.encode(
             &mut encoder,
             &view,
             &self.camera,
             &draws,
+            &lights,
             &self.settings.rendering(),
             self.time,
         );
@@ -1070,7 +688,7 @@ impl Game {
         }
         self.frames += 1;
         if self.frames > 30 {
-            self.frame_times.push(raw * 1000.0);
+            self.frame_times.push(ms);
         }
         let done = (self.options.smoke > 0 && self.frames >= self.options.smoke)
             || (self.options.benchmark > 0
@@ -1098,6 +716,7 @@ impl Game {
         }
         Ok(())
     }
+
     fn render_ui(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1121,6 +740,7 @@ impl Game {
         });
         self.egui_renderer.render(&mut pass, primitives, screen);
     }
+
     fn screenshot(
         &mut self,
         path: &std::path::Path,
@@ -1155,6 +775,7 @@ impl Game {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        let lights = self.scene.render_lights();
         let mut encoder = self
             .renderer
             .device
@@ -1164,6 +785,7 @@ impl Game {
             &view,
             &self.camera,
             draws,
+            &lights,
             &self.settings.rendering(),
             self.time,
         );
@@ -1234,7 +856,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("V.O.I.D. Engine · Rust · Physics Lab")
+            .with_title("Void engine")
             .with_inner_size(PhysicalSize::new(settings.width, settings.height))
             .build(&event_loop)?,
     );
@@ -1259,7 +881,6 @@ fn main() -> Result<()> {
                         if !focused && game.options.smoke == 0 && game.options.benchmark == 0 {
                             game.pause();
                             game.keys.clear();
-                            game.drop(false);
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
@@ -1269,28 +890,13 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        if game.state == State::Playing {
-                            match (button, state) {
-                                (MouseButton::Left, ElementState::Pressed) => game.grab(),
-                                (MouseButton::Left, ElementState::Released) => {
-                                    if !game.keep_held {
-                                        game.drop(false)
-                                    }
-                                }
-                                (MouseButton::Right, ElementState::Pressed) => game.shove(),
-                                _ => {}
-                            }
-                        }
-                    }
                     WindowEvent::MouseWheel { delta, .. } => {
-                        if game.state == State::Playing {
-                            let amount = match delta {
+                        if game.state == ScreenState::Playing && game.held_light.is_some() {
+                            let y = match delta {
                                 MouseScrollDelta::LineDelta(_, y) => y,
-                                MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
+                                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 30.0,
                             };
-                            game.hold_distance =
-                                (game.hold_distance + amount * 0.25).clamp(1.3, 6.0);
+                            game.hold_dist = (game.hold_dist + y * 0.55).clamp(1.2, 12.0);
                         }
                     }
                     WindowEvent::RedrawRequested => {
@@ -1307,7 +913,7 @@ fn main() -> Result<()> {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                if game.state == State::Playing && game.focused {
+                if game.state == ScreenState::Playing && game.focused {
                     game.look += Vec2::new(delta.0 as f32, delta.1 as f32);
                 }
             }
@@ -1315,7 +921,9 @@ fn main() -> Result<()> {
             _ => {}
         }
         if game.exit {
-            game.settings.save();
+            if game.options.smoke == 0 && game.options.benchmark == 0 {
+                game.settings.save();
+            }
             game.capture_mouse(false);
             target.exit();
         }
@@ -1326,9 +934,11 @@ fn main() -> Result<()> {
     );
     Ok(())
 }
+
 fn pollster_main(window: Arc<Window>, settings: Settings, options: Options) -> Result<Game> {
     void_engine::block_on(Game::new(window, settings, options))
 }
+
 fn selftest() -> Result<()> {
     let mut p = physics::Physics::default();
     p.add(
@@ -1341,7 +951,7 @@ fn selftest() -> Result<()> {
     );
     let player = p.player(Vec3::new(4.0, 1.0, 4.0));
     let b = p.add(
-        PropKind::Crate.shape(),
+        physics::Shape::Box(Vec3::splat(0.45)),
         Vec3::new(0.0, 2.0, 0.0),
         Quat::IDENTITY,
         13.0,
@@ -1376,12 +986,6 @@ fn selftest() -> Result<()> {
     );
     p.release(b, Some(Vec3::new(0.0, 2.0, -17.0)));
     anyhow::ensure!(p.bodies[b].linvel().z < -16.0, "Throw failed");
-    let model =
-        void_engine::glb::load(&void_engine::asset_dir().join("models/void-manipulator.glb"))?;
-    anyhow::ensure!(
-        model.image.is_some() && !model.mesh.vertices.is_empty(),
-        "GLB failed"
-    );
-    println!("SELFTEST PASS: gravity, settling, picking, grab spring, throw, GLB + texture ({} triangles)",model.mesh.indices.len()/3);
+    println!("SELFTEST PASS: gravity, settling, picking, grab spring, throw");
     Ok(())
 }

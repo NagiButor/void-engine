@@ -21,6 +21,9 @@ pub struct Settings {
     pub volume: f32,
     pub hdr_audio: f32,
     pub muted: bool,
+    pub time_of_day: f32,
+    pub sun_azimuth: f32,
+    pub sun_tilt: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -41,6 +44,9 @@ impl Default for Settings {
             volume: 0.75,
             hdr_audio: 0.8,
             muted: false,
+            time_of_day: 13.5,
+            sun_azimuth: -28.0,
+            sun_tilt: 62.0,
         }
     }
 }
@@ -74,6 +80,9 @@ impl Settings {
         s.sensitivity = clamp(s.sensitivity, 0.2, 3.0, 1.0);
         s.volume = clamp(s.volume, 0.0, 1.0, 0.75);
         s.hdr_audio = clamp(s.hdr_audio, 0.0, 1.0, 0.8);
+        s.time_of_day = clamp(s.time_of_day, 0.0, 24.0, 13.5);
+        s.sun_azimuth = clamp(s.sun_azimuth, -180.0, 180.0, -28.0);
+        s.sun_tilt = clamp(s.sun_tilt, 15.0, 85.0, 62.0);
         s
     }
     pub fn save(&self) {
@@ -90,6 +99,9 @@ impl Settings {
             shadows: self.shadows,
             ao: self.ao,
             bloom: self.bloom,
+            time_of_day: self.time_of_day,
+            sun_azimuth: self.sun_azimuth,
+            sun_tilt: self.sun_tilt,
         }
     }
 }

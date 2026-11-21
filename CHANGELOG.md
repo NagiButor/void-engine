@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Remove first-person weapon/hand rig (`rig.rs`), `void-manipulator.glb`, viewmodel render pass, and all scene props/items (`PropKind`, spawning, grab/throw interactions), keeping the Rapier 3D physics core and architectural hall intact.
+- Redesign the UI (`crates/void-demo/src/ui.rs`) with an Obsidian-Glass & Solar-Amber aesthetic: animated geometric V.O.I.D. emblem, custom animated buttons/toggles/sliders/segmented controls, tabbed settings modal, live frame-time sparkline HUD, physics kinematics bar, dynamic reticle, and keycap hints.
+
 ## 0.2.0 — 2026-11-10
 
 ### Rust runtime

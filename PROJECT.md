@@ -13,19 +13,19 @@
 ```text
 Cargo.toml               workspace (void-engine, void-demo), общие версии зависимостей
 crates/void-engine/src/  библиотека движка
-  render.rs              wgpu: устройство, HDR/тени/viewmodel/post проходы
+  render.rs              wgpu: устройство, HDR/тени/post проходы
   mesh.rs                процедурные меши (скошенные боксы, сферы, lathe)
   textures.rs            процедурные бесшовные атласы цвет/roughness + normal
   glb.rs                 загрузчик статических GLB
   physics.rs             обёртка над Rapier: группы, лучи, пружина захвата, удары
-  scene.rs               сборка пропов и сама лаборатория (PropKind, spawn, reset, draws)
+  scene.rs               архитектурный зал лаборатории и коллайдеры (Lab, reset, draws)
   audio.rs               пространственный 32-голосный микшер на rodio, WAV
   lib.rs                 экспорт модулей, asset_dir(), save_rgba(), тест валидации шейдеров
 crates/void-demo/src/    игра (бинарь void_demo)
-  main.rs                event loop, игрок, взаимодействие, частицы, меню/HUD/настройки, --selftest
-  rig.rs                 руки/оружие от первого лица, IK локтей, анимации
+  main.rs                event loop, физический игрок, ввод, телеметрия, --selftest
+  ui.rs                  кастомный интерфейс V.O.I.D. (меню, пауза, вкладки настроек, HUD)
   settings.rs            настройки в settings.toml
-assets/                  shaders (pbr.wgsl, post.wgsl), models (GLB), audio/sfx (WAV), fonts
+assets/                  shaders (pbr.wgsl, post.wgsl), audio/sfx (WAV), fonts
 tools/                   build-rust.ps1 (упаковка), generate_sfx.py / postprocess_sfx.py (звуки)
 docs/                    скриншоты для README
 ```

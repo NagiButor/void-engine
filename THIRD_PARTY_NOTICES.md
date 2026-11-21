@@ -26,6 +26,7 @@ Crate license texts ship in the respective registry source distributions.
 | Component | Version / pin | License | Use | Link |
 | --- | --- | --- | --- | --- |
 | **Roboto** | hinted regular TTF | Apache-2.0 | UI font | https://github.com/googlefonts/roboto-2 |
+| **DevTextures** | Grid 4×4 PNG sets in `assets/textures/dev` | CC0 1.0 | Dev grid albedo, normal & roughness maps | `assets/textures/dev/LICENSE.txt` |
 | **MOSS-SoundEffect v2.0** | generated clips in `assets/audio/sfx` | Apache-2.0 (model); generated output | AI-generated sound effects | https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0 |
 | **DirectX 12 / DXGI** | Windows SDK | Microsoft SDK license | System graphics API | Windows SDK |
 | **Vulkan loader** | GPU driver | Khronos / driver license | Runtime loader | system |
