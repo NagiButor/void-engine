@@ -7,10 +7,18 @@ struct Globals {
     view_proj: mat4x4<f32>,
     light_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
-    eye: vec4<f32>,
+    view: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
+    sky_proj: mat4x4<f32>,
+    eye: vec4<f32>,          // xyz = eye, w = 1.0
+    prev_eye: vec4<f32>,     // xyz = prev_eye, w = frame_index
+    proj_params: vec4<f32>,  // x = 1/P00, y = 1/P11, z = near, w = far
     sun: vec4<f32>,          // xyz = sun dir, w = active point light count
+    moon: vec4<f32>,         // xyz = moon dir, w = moon phase
     settings: vec4<f32>,     // x = exposure, y = fog, z = shadow quality, w = ao enabled
-    sky: vec4<f32>,          // x = time
+    sky: vec4<f32>,          // x = time, y = time_of_day, z = sun_azimuth_rad, w = sun_tilt_rad
+    atmos: vec4<f32>,        // x = clouds_enabled, y = cloud_coverage, z = show_trajectory, w = aspect
+    gi_vol: vec4<f32>,       // x = gi_enabled, y = gi_intensity, z = vol_enabled, w = vol_intensity
     lights: array<PointLight, 16>,
 };
 
@@ -22,6 +30,11 @@ struct Globals {
 @group(0) @binding(5) var shadow_map: texture_depth_2d;
 @group(0) @binding(6) var shadow_sampler: sampler_comparison;
 @group(0) @binding(7) var point_shadow_map: texture_depth_2d_array;
+@group(0) @binding(8) var sun_tex: texture_2d<f32>;
+@group(0) @binding(9) var moon_tex: texture_2d<f32>;
+@group(0) @binding(10) var clouds_tex: texture_2d<f32>;
+@group(0) @binding(11) var sky_sampler: sampler;
+@group(0) @binding(12) var gi_tex: texture_2d<f32>;
 
 struct Out {
     @builtin(position) clip: vec4<f32>,
@@ -41,6 +54,7 @@ struct Out {
 }
 
 const PI: f32 = 3.14159265;
+const TAU: f32 = 6.28318530;
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
@@ -58,8 +72,14 @@ fn hash31(p: vec3<f32>) -> f32 {
     return fract((q.x + q.y) * q.z);
 }
 
+fn rotate_y(v: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec3<f32>(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
+}
+
 fn compute_ssao(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, world: vec3<f32>, n: vec3<f32>) -> f32 {
-    if g.settings.w < 0.5 {
+    if g.settings.w < 0.5 || g.gi_vol.x > 0.5 {
         return 1.0;
     }
     var poisson = array<vec2<f32>, 12>(
@@ -70,7 +90,7 @@ fn compute_ssao(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, world: vec3<f3
         vec2<f32>( 0.507,  0.064), vec2<f32>( 0.896,  0.412),
         vec2<f32>(-0.322, -0.933), vec2<f32>(-0.792, -0.598),
     );
-    let angle = interleaved_gradient_noise(vec2<f32>(pixel)) * 6.2831853;
+    let angle = interleaved_gradient_noise(vec2<f32>(pixel)) * TAU;
     let c = cos(angle);
     let s = sin(angle);
     let rot = mat2x2<f32>(vec2<f32>(c, s), vec2<f32>(-s, c));
@@ -79,8 +99,10 @@ fn compute_ssao(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, world: vec3<f3
     let screen_radius = clamp(24.0 / max(view_dist, 1.0), 4.0, 22.0);
     let inv_dims = 1.0 / vec2<f32>(dims);
 
+    let tap_count = select(12, 6, g.gi_vol.x > 0.5);
+    let step_inc = select(1, 2, g.gi_vol.x > 0.5);
     var occ = 0.0;
-    for (var i = 0; i < 12; i++) {
+    for (var i = 0; i < 12; i += step_inc) {
         let dir = rot * poisson[i];
         let step_scale = 0.25 + 0.75 * (f32(i) + 0.5) / 12.0;
         let offset = dir * (screen_radius * step_scale);
@@ -100,7 +122,7 @@ fn compute_ssao(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, world: vec3<f3
         let range = 1.0 - smoothstep(0.35, 1.35, dist);
         occ += ndot * range;
     }
-    return clamp(1.0 - (occ / 12.0) * 2.1, 0.22, 1.0);
+    return clamp(1.0 - (occ / f32(tap_count)) * 2.1, 0.22, 1.0);
 }
 
 fn shadow_visibility(pixel: vec2<i32>, world: vec3<f32>, n: vec3<f32>, light_dir: vec3<f32>) -> f32 {
@@ -132,7 +154,7 @@ fn shadow_visibility(pixel: vec2<i32>, world: vec3<f32>, n: vec3<f32>, light_dir
         vec2<f32>(-0.24188840,  0.99706507), vec2<f32>(-0.81409955,  0.91437590),
         vec2<f32>( 0.19984126,  0.78641367), vec2<f32>( 0.14383161, -0.14100790),
     );
-    let angle = interleaved_gradient_noise(vec2<f32>(pixel)) * 6.2831853;
+    let angle = interleaved_gradient_noise(vec2<f32>(pixel)) * TAU;
     let c = cos(angle);
     let s = sin(angle);
     let rot = mat2x2<f32>(vec2<f32>(c, s), vec2<f32>(-s, c));
@@ -218,7 +240,7 @@ fn point_shadow_visibility(
         vec2<f32>(-0.350,  0.000), vec2<f32>( 0.350,  0.000),
         vec2<f32>( 0.000, -0.350), vec2<f32>( 0.000,  0.350),
     );
-    let angle = interleaved_gradient_noise(vec2<f32>(pixel)) * 6.2831853;
+    let angle = interleaved_gradient_noise(vec2<f32>(pixel)) * TAU;
     let c = cos(angle);
     let s = sin(angle);
     let rot = mat2x2<f32>(vec2<f32>(c, s), vec2<f32>(-s, c));
@@ -253,11 +275,39 @@ fn brdf(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, albedo: vec3<f32>, rough: f32,
     return ((1.0 - f) * (1.0 - metal) * albedo / PI + distribution * geometry * f / (4.0 * nl * nv)) * nl;
 }
 
-fn moon_direction(sun: vec3<f32>) -> vec3<f32> {
-    return normalize(vec3<f32>(-sun.x, max(-sun.y, 0.18), -sun.z));
+fn orbit_arc_intensity(dir: vec3<f32>, azimuth_rad: f32, tilt_rad: f32) -> f32 {
+    if dir.y < 0.005 {
+        return 0.0;
+    }
+    let plane_r = rotate_y(vec3<f32>(1.0, 0.0, 0.0), azimuth_rad);
+    let plane_u = rotate_y(vec3<f32>(0.0, sin(tilt_rad), cos(tilt_rad)), azimuth_rad);
+    let plane_n = normalize(cross(plane_r, plane_u));
+
+    let dist_to_plane = abs(dot(dir, plane_n));
+    let line_mask = 1.0 - smoothstep(0.0009, 0.0023, dist_to_plane);
+    if line_mask <= 0.001 {
+        return 0.0;
+    }
+    let angle = atan2(dot(dir, plane_u), dot(dir, plane_r));
+    let hours = fract(angle / TAU) * 24.0;
+    // Fine dotted astronomical arc + hourly markers
+    let dash = smoothstep(0.35, 0.65, sin(hours * TAU * 6.0));
+    let tick = 1.0 - smoothstep(0.025, 0.07, abs(fract(hours) - 0.5));
+    let horizon_fade = smoothstep(0.005, 0.07, dir.y);
+    return line_mask * max(dash * 0.55, tick * 1.0) * horizon_fade;
 }
 
-fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
+fn sample_clouds_smooth(uv: vec2<f32>) -> vec4<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(clouds_tex));
+    let c = textureSampleLevel(clouds_tex, sky_sampler, uv, 0.0) * 0.40;
+    let a = textureSampleLevel(clouds_tex, sky_sampler, uv + vec2<f32>(-0.75, -0.75) * texel, 0.0) * 0.15;
+    let b = textureSampleLevel(clouds_tex, sky_sampler, uv + vec2<f32>( 0.75, -0.75) * texel, 0.0) * 0.15;
+    let d = textureSampleLevel(clouds_tex, sky_sampler, uv + vec2<f32>(-0.75,  0.75) * texel, 0.0) * 0.15;
+    let e = textureSampleLevel(clouds_tex, sky_sampler, uv + vec2<f32>( 0.75,  0.75) * texel, 0.0) * 0.15;
+    return c + a + b + d + e;
+}
+
+fn sky_color(dir: vec3<f32>, sun: vec3<f32>, moon: vec3<f32>, draw_discs: bool) -> vec3<f32> {
     let elev = sun.y;
     let day = smoothstep(-0.08, 0.28, elev);
     let night = 1.0 - smoothstep(-0.18, 0.05, elev);
@@ -290,16 +340,53 @@ fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
     );
 
     if draw_discs {
-        // Sun atmospheric halo & solar disc (fades cleanly below horizon).
-        let sun_vis = smoothstep(-0.04, 0.05, elev);
-        let sun_dot = max(dot(dir, sun), 0.0);
-        let sun_tint = mix(vec3<f32>(1.0, 0.42, 0.12), vec3<f32>(1.0, 0.92, 0.78), smoothstep(0.0, 0.38, elev));
-        sky += sun_tint * pow(sun_dot, 28.0) * (0.35 + sunset * 0.55) * sun_vis;
-        sky += sun_tint * 2.4 * smoothstep(0.9992, 0.99975, sun_dot) * sun_vis;
+        let horizon_clip = smoothstep(-0.03, 0.035, dir.y);
 
-        // Crisp pinpoint stars & moon disc at night.
+        // Textured Solar Disc + Corona Halo
+        let sun_vis = smoothstep(-0.05, 0.04, elev) * horizon_clip;
+        let sun_dot = max(dot(dir, sun), 0.0);
+        let sun_tint = mix(vec3<f32>(1.0, 0.48, 0.16), vec3<f32>(1.0, 0.94, 0.80), smoothstep(0.0, 0.38, elev));
+        sky += sun_tint * pow(sun_dot, 24.0) * (0.30 + sunset * 0.50) * sun_vis;
+        sky += sun_tint * pow(sun_dot, 220.0) * 0.55 * sun_vis;
+
+        if sun_vis > 0.001 && sun_dot > 0.99 {
+            let sun_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(sun.y) > 0.98);
+            let sun_r = normalize(cross(sun_ref, sun));
+            let sun_u = cross(sun, sun_r);
+            let sun_ang = 0.036;
+            let sx = dot(dir, sun_r) / sun_ang;
+            let sy = dot(dir, sun_u) / sun_ang;
+            let sr = length(vec2<f32>(sx, sy));
+            if sr < 1.0 {
+                let swirl = vec2<f32>(
+                    sin(g.sky.x * 0.6 + sy * 8.0),
+                    cos(g.sky.x * 0.5 + sx * 8.0)
+                ) * 0.0035;
+                let suv = clamp(vec2<f32>(sx, sy) * 0.5 + 0.5 + swirl, vec2<f32>(0.01), vec2<f32>(0.99));
+                let photosphere = textureSampleLevel(sun_tex, sky_sampler, suv, 0.0).rgb;
+                let limb = pow(max(1.0 - sr * sr, 0.0), 0.45);
+                let limb_tint = mix(vec3<f32>(1.0, 0.32, 0.06), vec3<f32>(1.0, 0.92, 0.72), limb);
+                let edge_mask = 1.0 - smoothstep(0.92, 1.0, sr);
+                let solar_disc = photosphere * limb_tint * (0.95 + 1.35 * limb) * sun_tint;
+                sky = mix(sky, solar_disc, edge_mask * sun_vis);
+            }
+        }
+
+        // Moon disc geometry (compute before stars so moon occludes background stars)
+        let moon_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(moon.y) > 0.98);
+        let moon_r = normalize(cross(moon_ref, moon));
+        let moon_u = cross(moon, moon_r);
+        let moon_ang = 0.032;
+        let moon_dot = max(dot(dir, moon), 0.0);
+        let mx = dot(dir, moon_r) / moon_ang;
+        let my = dot(dir, moon_u) / moon_ang;
+        let mr = length(vec2<f32>(mx, my));
+        let in_moon = (moon_dot > 0.99) && (mr < 1.0) && (moon.y > -0.05);
+        let moon_mask = select(0.0, 1.0 - smoothstep(0.95, 1.0, mr), in_moon) * horizon_clip;
+
+        // Crisp pinpoint stars at night (occluded by Moon disc)
         let star_night = 1.0 - smoothstep(-0.26, -0.06, elev);
-        if star_night > 0.01 && dir.y > 0.02 {
+        if star_night > 0.01 && dir.y > 0.02 && moon_mask < 0.95 {
             let star_pos = dir * 210.0;
             let star_cell = floor(star_pos);
             let h = hash31(star_cell);
@@ -307,21 +394,44 @@ fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
                 let d = length(fract(star_pos) - vec3<f32>(0.5));
                 let pinpoint = smoothstep(0.26, 0.03, d);
                 let twinkle = 0.70 + 0.30 * sin(g.sky.x * 2.2 + h * 120.0);
-                let star_fade = smoothstep(0.02, 0.25, dir.y) * star_night;
+                let star_fade = smoothstep(0.02, 0.25, dir.y) * star_night * (1.0 - moon_mask);
                 sky += vec3<f32>(0.84, 0.90, 1.0) * pinpoint * ((h - 0.985) / 0.015) * 1.45 * twinkle * star_fade;
             }
         }
-        let moon = moon_direction(sun);
-        let moon_dot = max(dot(dir, moon), 0.0);
-        let moon_vis = smoothstep(-0.02, -0.14, elev);
-        sky += vec3<f32>(0.24, 0.36, 0.58) * pow(moon_dot, 96.0) * 0.35 * moon_vis;
-        sky += vec3<f32>(0.90, 0.94, 1.0) * 1.35 * smoothstep(0.99945, 0.99982, moon_dot) * moon_vis;
+
+        // Textured Lunar Disc with 3D crater relief, solar phase lighting & earthshine
+        let moon_sky_vis = smoothstep(-0.04, 0.05, moon.y) * horizon_clip;
+        let moon_halo_vis = moon_sky_vis * (1.0 - smoothstep(-0.08, 0.12, elev) * 0.75);
+        sky += vec3<f32>(0.24, 0.36, 0.58) * pow(moon_dot, 84.0) * 0.38 * moon_halo_vis;
+
+        if moon_mask > 0.001 {
+            let muv = clamp(vec2<f32>(mx, my) * 0.5 + 0.5, vec2<f32>(0.005), vec2<f32>(0.995));
+            let moon_sample = textureSampleLevel(moon_tex, sky_sampler, muv, 0.0);
+            let texel = 1.0 / 512.0;
+            let hx = textureSampleLevel(moon_tex, sky_sampler, muv + vec2<f32>(texel, 0.0), 0.0).a
+                - textureSampleLevel(moon_tex, sky_sampler, muv - vec2<f32>(texel, 0.0), 0.0).a;
+            let hy = textureSampleLevel(moon_tex, sky_sampler, muv + vec2<f32>(0.0, texel), 0.0).a
+                - textureSampleLevel(moon_tex, sky_sampler, muv - vec2<f32>(0.0, texel), 0.0).a;
+
+            let mz = sqrt(max(1.0 - mr * mr, 0.0));
+            let n_world = normalize(moon_r * (mx - hx * 2.2) + moon_u * (my - hy * 2.2) - moon * mz);
+            let ndl = max(dot(n_world, sun), 0.0);
+            let ndv = max(mz, 0.08);
+            // Lommel-Seeliger dusty regolith diffuse falloff
+            let regolith = (ndl / (ndl + ndv * 0.42 + 0.01)) * 1.55;
+            let earthshine = vec3<f32>(0.032, 0.048, 0.085) * (1.0 - smoothstep(-0.08, 0.15, elev));
+            let moon_lit = moon_sample.rgb * (vec3<f32>(0.96, 0.97, 1.02) * (regolith * 1.42) + earthshine);
+
+            // Blend naturally with daytime atmospheric scattering in front of the moon
+            let day_fade = mix(1.0, 0.55, day);
+            sky = mix(sky, sky * day + moon_lit * day_fade, moon_mask * moon_sky_vis);
+        }
     }
 
     return sky;
 }
 
-fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, sun: vec3<f32>) -> vec4<f32> {
+fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, sun: vec3<f32>, moon: vec3<f32>, is_viewmodel: bool) -> vec4<f32> {
     let albedo_metal = textureLoad(g_albedo_metal, pixel, 0);
     let normal_rough = textureLoad(g_normal_rough, pixel, 0);
     let emissive = textureLoad(g_emissive, pixel, 0);
@@ -339,27 +449,34 @@ fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, s
     let sunset = exp(-pow((elev - 0.02) / 0.15, 2.0));
 
     let ao = compute_ssao(pixel, dims, uv, world, n);
-    let shadow_dir = select(moon_direction(sun), sun, elev >= -0.02);
+    let shadow_dir = select(moon, sun, elev >= -0.02);
     let visibility = shadow_visibility(pixel, world, n, shadow_dir);
 
-    // Dynamic ambient hemisphere (day -> sunset -> night).
+    var light = vec3<f32>(0.0);
+
+    // Fallback hemisphere ambient when GI is disabled (or soft viewmodel GI fill)
     let sky_hemi_day = vec3<f32>(0.24, 0.30, 0.40);
     let sky_hemi_sunset = vec3<f32>(0.30, 0.18, 0.16);
     let sky_hemi_night = vec3<f32>(0.022, 0.032, 0.058);
     let sky_hemi = mix(mix(sky_hemi_night, sky_hemi_day, day), sky_hemi_sunset, sunset * 0.65);
     let gnd_hemi = mix(vec3<f32>(0.010, 0.013, 0.022), vec3<f32>(0.11, 0.10, 0.095), day);
     let hemi = mix(gnd_hemi, sky_hemi, n.y * 0.5 + 0.5);
-    var light = albedo * hemi * (1.0 - metal * 0.68) * ao;
 
-    // Directional sun (fades cleanly at horizon) + cool moonlight at night.
+    if g.gi_vol.x < 0.5 {
+        light += albedo * hemi * (1.0 - metal * 0.68) * ao;
+    } else if is_viewmodel {
+        let vm_gi = textureSampleLevel(gi_tex, sky_sampler, uv, 0.0).rgb;
+        light += albedo * mix(hemi, vm_gi, 0.72) * (1.0 - metal * 0.68) * ao;
+    }
+
+    // Directional sun (fades cleanly at horizon) + cool moonlight along moon trajectory.
     let sun_strength = smoothstep(-0.02, 0.09, elev);
     let sun_radiance = mix(vec3<f32>(3.1, 1.05, 0.32), vec3<f32>(3.35, 2.95, 2.42), smoothstep(0.02, 0.35, elev));
     light += brdf(n, view, sun, albedo, rough, metal) * sun_radiance * (sun_strength * visibility);
 
-    let moon_strength = smoothstep(-0.02, -0.14, elev);
+    let moon_strength = (1.0 - sun_strength) * smoothstep(-0.03, 0.10, moon.y);
     if moon_strength > 0.001 {
-        let moon = moon_direction(sun);
-        let moon_radiance = vec3<f32>(0.22, 0.31, 0.52) * moon_strength;
+        let moon_radiance = vec3<f32>(0.24, 0.34, 0.56) * moon_strength;
         light += brdf(n, view, moon, albedo, rough, metal) * moon_radiance * visibility;
     }
 
@@ -383,7 +500,7 @@ fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, s
 
     // Specular environment reflection with horizon & AO attenuation.
     let reflected = reflect(-view, n);
-    let env = sky_color(reflected, sun, false);
+    let env = sky_color(reflected, sun, moon, false);
     let f = fresnel(max(dot(n, view), 0.0), mix(vec3<f32>(0.04), albedo, metal));
     let spec_ao = mix(1.0, ao, 0.72);
     light += env * f * (1.0 - rough * 0.72) * mix(0.32, 0.62, day) * spec_ao;
@@ -391,13 +508,17 @@ fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, s
     // Emissive surface contribution.
     light += emissive.rgb;
 
-    // Subtle aerial perspective fog synced with time of day.
-    let fog_day = vec3<f32>(0.36, 0.44, 0.54);
-    let fog_sunset = vec3<f32>(0.42, 0.24, 0.18);
-    let fog_night = vec3<f32>(0.015, 0.022, 0.042);
-    let fog_color = mix(mix(fog_night, fog_day, day), fog_sunset, sunset * 0.7) * (1.0 - night * 0.15);
-    let fog = 1.0 - exp(-length(g.eye.xyz - world) * 0.004 * g.settings.y);
-    return vec4<f32>(mix(light, fog_color, fog), 1.0);
+    if is_viewmodel {
+        let fog_day = vec3<f32>(0.36, 0.44, 0.54);
+        let fog_sunset = vec3<f32>(0.42, 0.24, 0.18);
+        let fog_night = vec3<f32>(0.015, 0.022, 0.042);
+        let fog_color = mix(mix(fog_night, fog_day, day), fog_sunset, sunset * 0.7) * (1.0 - night * 0.15);
+        let fog = 1.0 - exp(-length(g.eye.xyz - world) * 0.004 * g.settings.y);
+        return vec4<f32>(mix(light, fog_color, fog), 1.0);
+    }
+
+    // Store AO in alpha so composite.wgsl can modulate GI cleanly before applying aerial fog.
+    return vec4<f32>(light, ao);
 }
 
 @fragment fn fs_main(v: Out) -> @location(0) vec4<f32> {
@@ -405,14 +526,36 @@ fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, s
     let pixel = clamp(vec2<i32>(v.clip.xy), vec2<i32>(0), dims - 1);
     let depth = textureLoad(g_depth, pixel, 0);
     let sun = normalize(g.sun.xyz);
+    let moon = normalize(g.moon.xyz);
 
     if depth >= 0.999999 {
         let far_world = reconstruct_world(v.uv, 1.0);
         let ray = normalize(far_world - g.eye.xyz);
-        return vec4<f32>(sky_color(ray, sun, true), 1.0);
+        var sky = sky_color(ray, sun, moon, true);
+
+        var cloud_t = 1.0;
+        if g.atmos.x > 0.5 {
+            let clouds = sample_clouds_smooth(v.uv);
+            sky = sky * clouds.a + clouds.rgb;
+            cloud_t = clouds.a;
+        }
+
+        if g.atmos.z > 0.5 {
+            let sun_arc = orbit_arc_intensity(ray, g.sky.z, g.sky.w);
+            let lunar_tilt = clamp(g.sky.w + radians(8.5) + sin(g.moon.w * TAU) * radians(5.0), radians(14.0), radians(88.0));
+            let lunar_az = g.sky.z - radians(14.0);
+            let moon_arc = orbit_arc_intensity(ray, lunar_az, lunar_tilt);
+            let arc_vis = mix(0.35, 0.78, cloud_t);
+            let arc_alpha = clamp((sun_arc + moon_arc) * 0.35 * arc_vis, 0.0, 0.5);
+            sky = mix(sky, sky * 0.55, arc_alpha);
+            sky += vec3<f32>(1.0, 0.72, 0.24) * (sun_arc * 0.52 * arc_vis);
+            sky += vec3<f32>(0.42, 0.78, 1.0) * (moon_arc * 0.48 * arc_vis);
+        }
+
+        return vec4<f32>(sky, 1.0);
     }
 
-    return shade_gbuffer(pixel, dims, v.uv, depth, sun);
+    return shade_gbuffer(pixel, dims, v.uv, depth, sun, moon, false);
 }
 
 @fragment fn fs_viewmodel(v: Out) -> @location(0) vec4<f32> {
@@ -423,5 +566,6 @@ fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, s
         discard;
     }
     let sun = normalize(g.sun.xyz);
-    return shade_gbuffer(pixel, dims, v.uv, depth, sun);
+    let moon = normalize(g.moon.xyz);
+    return shade_gbuffer(pixel, dims, v.uv, depth, sun, moon, true);
 }

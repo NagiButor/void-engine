@@ -1,4 +1,6 @@
+pub use crate::celestial::{moon_direction, sun_direction};
 use crate::{
+    celestial::{self, CELESTIAL_TEX_SIZE, CLOUD_NOISE_SIZE, WEATHER_TEX_SIZE},
     mesh::{MeshData, Vertex},
     textures,
 };
@@ -12,6 +14,8 @@ use winit::window::Window;
 pub type MeshId = usize;
 const MAX_INSTANCES: usize = 16384;
 const SHADOW_SIZE: u32 = 4096;
+const SKY_HEIGHT_SIZE: u32 = 256;
+const DIRECT_MIPS: u32 = 4;
 const POINT_SHADOW_SIZE: u32 = 512;
 pub const MAX_POINT_LIGHTS: usize = 16;
 const MAX_SHADOW_LIGHTS: usize = 8;
@@ -108,10 +112,18 @@ struct Globals {
     vp: [[f32; 4]; 4],
     light: [[f32; 4]; 4],
     inverse: [[f32; 4]; 4],
+    view: [[f32; 4]; 4],
+    prev_vp: [[f32; 4]; 4],
+    sky_proj: [[f32; 4]; 4],
     eye: [f32; 4],
+    prev_eye: [f32; 4],
+    proj_params: [f32; 4],
     sun: [f32; 4],
+    moon: [f32; 4],
     settings: [f32; 4],
     sky: [f32; 4],
+    atmos: [f32; 4],
+    gi_vol: [f32; 4],
     lights: [PointLight; MAX_POINT_LIGHTS],
 }
 
@@ -176,9 +188,17 @@ pub struct RenderSettings {
     pub shadows: u32,
     pub ao: bool,
     pub bloom: bool,
+    pub gi: bool,
+    pub gi_intensity: f32,
+    pub clouds: bool,
+    pub cloud_coverage: f32,
+    pub volumetric: bool,
+    pub volumetric_intensity: f32,
     pub time_of_day: f32,
     pub sun_azimuth: f32,
     pub sun_tilt: f32,
+    pub moon_phase: f32,
+    pub show_trajectory: bool,
 }
 impl Default for RenderSettings {
     fn default() -> Self {
@@ -188,23 +208,19 @@ impl Default for RenderSettings {
             shadows: 2,
             ao: true,
             bloom: true,
+            gi: true,
+            gi_intensity: 1.0,
+            clouds: true,
+            cloud_coverage: 0.52,
+            volumetric: true,
+            volumetric_intensity: 1.0,
             time_of_day: 13.5,
             sun_azimuth: -28.0,
             sun_tilt: 62.0,
+            moon_phase: 0.42,
+            show_trajectory: true,
         }
     }
-}
-
-pub fn sun_direction(time_of_day: f32, azimuth_deg: f32, tilt_deg: f32) -> Vec3 {
-    let day_angle =
-        (time_of_day.rem_euclid(24.0) / 24.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
-    let tilt = tilt_deg.clamp(10.0, 89.0).to_radians();
-    let local = Vec3::new(
-        day_angle.cos(),
-        day_angle.sin() * tilt.sin(),
-        day_angle.sin() * tilt.cos(),
-    );
-    (glam::Quat::from_rotation_y(azimuth_deg.to_radians()) * local).normalize()
 }
 
 struct GpuMesh {
@@ -222,13 +238,36 @@ struct Targets {
     emissive: wgpu::TextureView,
     _depth: wgpu::Texture,
     depth: wgpu::TextureView,
+    _direct_hdr: wgpu::Texture,
+    direct_hdr_mips: Vec<wgpu::TextureView>,
+    direct_down_bgs: Vec<wgpu::BindGroup>,
+    _clouds_a: wgpu::Texture,
+    clouds_a: wgpu::TextureView,
+    _clouds_b: wgpu::Texture,
+    clouds_b: wgpu::TextureView,
+    _gi_a: wgpu::Texture,
+    gi_a: wgpu::TextureView,
+    _gi_b: wgpu::Texture,
+    gi_b: wgpu::TextureView,
+    _gi_filtered: wgpu::Texture,
+    gi_filtered: wgpu::TextureView,
+    _vol_raw: wgpu::Texture,
+    vol_raw: wgpu::TextureView,
+    _vol_filtered: wgpu::Texture,
+    vol_filtered: wgpu::TextureView,
     _hdr: wgpu::Texture,
     hdr: wgpu::TextureView,
     _bloom: wgpu::Texture,
     bloom_mips: Vec<wgpu::TextureView>,
     bloom_down_bgs: Vec<wgpu::BindGroup>,
     bloom_up_bgs: Vec<wgpu::BindGroup>,
-    deferred: wgpu::BindGroup,
+    clouds_bgs: [wgpu::BindGroup; 2],
+    deferred: [wgpu::BindGroup; 2],
+    gi_bgs: [wgpu::BindGroup; 2],
+    gi_blur_bgs: [wgpu::BindGroup; 2],
+    vol_bgs: [wgpu::BindGroup; 2],
+    vol_blur_bg: wgpu::BindGroup,
+    composite_bg: wgpu::BindGroup,
     post: wgpu::BindGroup,
 }
 
@@ -246,26 +285,54 @@ pub struct Renderer {
     point_shadow_uniforms: wgpu::Buffer,
     point_shadow_bindings: wgpu::BindGroup,
     gbuffer_pipeline: wgpu::RenderPipeline,
+    sky_height_pipeline: wgpu::RenderPipeline,
+    clouds_pipeline: wgpu::RenderPipeline,
     deferred_pipeline: wgpu::RenderPipeline,
     deferred_viewmodel_pipeline: wgpu::RenderPipeline,
+    gi_pipeline: wgpu::RenderPipeline,
+    gi_blur_pipeline: wgpu::RenderPipeline,
+    volumetric_pipeline: wgpu::RenderPipeline,
+    vol_blur_pipeline: wgpu::RenderPipeline,
+    composite_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     point_shadow_pipeline: wgpu::RenderPipeline,
     bloom_prefilter_pipeline: wgpu::RenderPipeline,
     bloom_downsample_pipeline: wgpu::RenderPipeline,
+    direct_down_pipeline: wgpu::RenderPipeline,
     bloom_upsample_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
     _shadow: wgpu::Texture,
     shadow_view: wgpu::TextureView,
+    _sky_height: wgpu::Texture,
+    sky_height_view: wgpu::TextureView,
     _point_shadow: wgpu::Texture,
     point_shadow_array_view: wgpu::TextureView,
     point_shadow_face_views: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
+    _sun_tex: wgpu::Texture,
+    sun_view: wgpu::TextureView,
+    _moon_tex: wgpu::Texture,
+    moon_view: wgpu::TextureView,
+    _cloud_noise_3d: wgpu::Texture,
+    cloud_noise_view: wgpu::TextureView,
+    _weather_tex: wgpu::Texture,
+    weather_view: wgpu::TextureView,
+    cloud_sampler: wgpu::Sampler,
+    sky_sampler: wgpu::Sampler,
+    clouds_layout: wgpu::BindGroupLayout,
     deferred_layout: wgpu::BindGroupLayout,
+    gi_layout: wgpu::BindGroupLayout,
+    bilateral_layout: wgpu::BindGroupLayout,
+    volumetric_layout: wgpu::BindGroupLayout,
+    composite_layout: wgpu::BindGroupLayout,
     bloom_layout: wgpu::BindGroupLayout,
     targets: Targets,
     post_layout: wgpu::BindGroupLayout,
     post_uniform: wgpu::Buffer,
     post_sampler: wgpu::Sampler,
+    prev_vp: Mat4,
+    prev_eye: Vec3,
+    frame_index: u32,
 }
 
 fn target(
@@ -294,21 +361,31 @@ fn target(
     (texture, view)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create_targets(
-    device: &wgpu::Device,
-    w: u32,
-    h: u32,
-    globals: &wgpu::Buffer,
-    shadow_view: &wgpu::TextureView,
-    point_shadow_array_view: &wgpu::TextureView,
-    shadow_sampler: &wgpu::Sampler,
-    deferred_layout: &wgpu::BindGroupLayout,
-    bloom_layout: &wgpu::BindGroupLayout,
-    post_layout: &wgpu::BindGroupLayout,
-    post_uniform: &wgpu::Buffer,
-    post_sampler: &wgpu::Sampler,
-) -> Targets {
+struct TargetContext<'a> {
+    globals: &'a wgpu::Buffer,
+    shadow_view: &'a wgpu::TextureView,
+    point_shadow_array_view: &'a wgpu::TextureView,
+    shadow_sampler: &'a wgpu::Sampler,
+    sky_height_view: &'a wgpu::TextureView,
+    sun_view: &'a wgpu::TextureView,
+    moon_view: &'a wgpu::TextureView,
+    cloud_noise_view: &'a wgpu::TextureView,
+    weather_view: &'a wgpu::TextureView,
+    cloud_sampler: &'a wgpu::Sampler,
+    sky_sampler: &'a wgpu::Sampler,
+    clouds_layout: &'a wgpu::BindGroupLayout,
+    deferred_layout: &'a wgpu::BindGroupLayout,
+    gi_layout: &'a wgpu::BindGroupLayout,
+    bilateral_layout: &'a wgpu::BindGroupLayout,
+    volumetric_layout: &'a wgpu::BindGroupLayout,
+    composite_layout: &'a wgpu::BindGroupLayout,
+    bloom_layout: &'a wgpu::BindGroupLayout,
+    post_layout: &'a wgpu::BindGroupLayout,
+    post_uniform: &'a wgpu::Buffer,
+    post_sampler: &'a wgpu::Sampler,
+}
+
+fn create_targets(device: &wgpu::Device, w: u32, h: u32, ctx: &TargetContext<'_>) -> Targets {
     let (albedo_metal_tex, albedo_metal) = target(
         device,
         "GBuffer albedo + metallic",
@@ -341,6 +418,31 @@ fn create_targets(
         wgpu::TextureFormat::Depth32Float,
         1,
     );
+    let direct_mip_count = w.max(h).ilog2().saturating_add(1).clamp(1, DIRECT_MIPS);
+    let direct_hdr_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Direct HDR + Sky"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: direct_mip_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let direct_hdr = direct_hdr_tex.create_view(&Default::default());
+    let direct_hdr_mips: Vec<wgpu::TextureView> = (0..direct_mip_count)
+        .map(|mip| {
+            direct_hdr_tex.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
     let (hdr_tex, hdr) = target(
         device,
         "HDR scene",
@@ -351,6 +453,64 @@ fn create_targets(
     );
     let bw = (w / 2).max(1);
     let bh = (h / 2).max(1);
+    let qw = (w / 4).max(1);
+    let qh = (h / 4).max(1);
+    let (clouds_a_tex, clouds_a) = target(
+        device,
+        "Quarter-res volumetric clouds ping",
+        qw,
+        qh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
+    let (clouds_b_tex, clouds_b) = target(
+        device,
+        "Quarter-res volumetric clouds pong",
+        qw,
+        qh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
+    let (gi_a_tex, gi_a) = target(
+        device,
+        "Half-res GI ping",
+        bw,
+        bh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
+    let (gi_b_tex, gi_b) = target(
+        device,
+        "Half-res GI pong",
+        bw,
+        bh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
+    let (gi_filtered_tex, gi_filtered) = target(
+        device,
+        "Half-res GI filtered",
+        bw,
+        bh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
+    let (vol_raw_tex, vol_raw) = target(
+        device,
+        "Quarter-res volumetric light",
+        qw,
+        qh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
+    let (vol_filtered_tex, vol_filtered) = target(
+        device,
+        "Quarter-res volumetric filtered",
+        qw,
+        qh,
+        wgpu::TextureFormat::Rgba16Float,
+        1,
+    );
     let mip_count = bw.max(bh).ilog2().saturating_add(1).clamp(1, BLOOM_MIPS);
     let bloom_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Bloom mip chain"),
@@ -378,7 +538,7 @@ fn create_targets(
     let bloom_bg = |view: &wgpu::TextureView| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Bloom pass bindings"),
-            layout: bloom_layout,
+            layout: ctx.bloom_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -386,7 +546,7 @@ fn create_targets(
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(post_sampler),
+                    resource: wgpu::BindingResource::Sampler(ctx.post_sampler),
                 },
             ],
         })
@@ -397,47 +557,260 @@ fn create_targets(
         bloom_down_bgs.push(bloom_bg(view));
     }
     let bloom_up_bgs: Vec<wgpu::BindGroup> = bloom_mips.iter().skip(1).map(&bloom_bg).collect();
-    let deferred = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Deferred lighting bindings"),
-        layout: deferred_layout,
+    let direct_down_bgs: Vec<wgpu::BindGroup> = direct_hdr_mips
+        .iter()
+        .take(direct_mip_count as usize - 1)
+        .map(&bloom_bg)
+        .collect();
+    let make_clouds_bg = |history: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Clouds bindings"),
+            layout: ctx.clouds_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(ctx.cloud_noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(ctx.weather_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(history),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(ctx.cloud_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(ctx.sky_sampler),
+                },
+            ],
+        })
+    };
+    let clouds_bgs = [make_clouds_bg(&clouds_b), make_clouds_bg(&clouds_a)];
+
+    let make_deferred_bg = |clouds_cur: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Deferred lighting bindings"),
+            layout: ctx.deferred_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&albedo_metal),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&normal_rough),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&emissive),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(ctx.shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(ctx.shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(ctx.point_shadow_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(ctx.sun_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(ctx.moon_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(clouds_cur),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(ctx.sky_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&gi_filtered),
+                },
+            ],
+        })
+    };
+    let deferred = [make_deferred_bg(&clouds_a), make_deferred_bg(&clouds_b)];
+
+    let make_gi_bg = |history: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GI bindings"),
+            layout: ctx.gi_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&normal_rough),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&direct_hdr),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(history),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(ctx.sky_height_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(ctx.post_sampler),
+                },
+            ],
+        })
+    };
+    let make_bilateral_bg = |src: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bilateral blur bindings"),
+            layout: ctx.bilateral_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&normal_rough),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(ctx.post_sampler),
+                },
+            ],
+        })
+    };
+    let gi_bgs = [make_gi_bg(&gi_b), make_gi_bg(&gi_a)];
+    let gi_blur_bgs = [make_bilateral_bg(&gi_a), make_bilateral_bg(&gi_b)];
+    let make_vol_bg = |clouds_cur: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Volumetric light bindings"),
+            layout: ctx.volumetric_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(ctx.shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(ctx.shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(clouds_cur),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(ctx.post_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(ctx.cloud_noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(ctx.cloud_sampler),
+                },
+            ],
+        })
+    };
+    let vol_bgs = [make_vol_bg(&clouds_a), make_vol_bg(&clouds_b)];
+    let vol_blur_bg = make_bilateral_bg(&vol_raw);
+    let composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Composite bindings"),
+        layout: ctx.composite_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: globals.as_entire_binding(),
+                resource: ctx.globals.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&albedo_metal),
+                resource: wgpu::BindingResource::TextureView(&direct_hdr),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&normal_rough),
+                resource: wgpu::BindingResource::TextureView(&gi_filtered),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::TextureView(&emissive),
+                resource: wgpu::BindingResource::TextureView(&vol_filtered),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(&depth),
+                resource: wgpu::BindingResource::TextureView(&albedo_metal),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: wgpu::BindingResource::TextureView(shadow_view),
+                resource: wgpu::BindingResource::TextureView(&normal_rough),
             },
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: wgpu::BindingResource::Sampler(shadow_sampler),
+                resource: wgpu::BindingResource::TextureView(&depth),
             },
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: wgpu::BindingResource::TextureView(point_shadow_array_view),
+                resource: wgpu::BindingResource::Sampler(ctx.post_sampler),
             },
         ],
     });
     let post = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Post bindings"),
-        layout: post_layout,
+        layout: ctx.post_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -445,11 +818,11 @@ fn create_targets(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Sampler(post_sampler),
+                resource: wgpu::BindingResource::Sampler(ctx.post_sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: post_uniform.as_entire_binding(),
+                resource: ctx.post_uniform.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
@@ -466,13 +839,36 @@ fn create_targets(
         emissive,
         _depth: depth_tex,
         depth,
+        _direct_hdr: direct_hdr_tex,
+        direct_hdr_mips,
+        direct_down_bgs,
+        _clouds_a: clouds_a_tex,
+        clouds_a,
+        _clouds_b: clouds_b_tex,
+        clouds_b,
+        _gi_a: gi_a_tex,
+        gi_a,
+        _gi_b: gi_b_tex,
+        gi_b,
+        _gi_filtered: gi_filtered_tex,
+        gi_filtered,
+        _vol_raw: vol_raw_tex,
+        vol_raw,
+        _vol_filtered: vol_filtered_tex,
+        vol_filtered,
         _hdr: hdr_tex,
         hdr,
         _bloom: bloom_tex,
         bloom_mips,
         bloom_down_bgs,
         bloom_up_bgs,
+        clouds_bgs,
         deferred,
+        gi_bgs,
+        gi_blur_bgs,
+        vol_bgs,
+        vol_blur_bg,
+        composite_bg,
         post,
     }
 }
@@ -617,8 +1013,26 @@ impl Renderer {
             ],
         });
         let atlas = textures::load(assets)?;
-        let color = upload_array(&device, &queue, "Albedo + roughness", &atlas.albedo, true);
-        let normal = upload_array(&device, &queue, "Tangent normals", &atlas.normal, false);
+        let color = upload_texture_mips(
+            &device,
+            &queue,
+            "Albedo + roughness",
+            textures::SIZE,
+            textures::SIZE,
+            textures::LAYERS,
+            &atlas.albedo,
+            true,
+        );
+        let normal = upload_texture_mips(
+            &device,
+            &queue,
+            "Tangent normals",
+            textures::SIZE,
+            textures::SIZE,
+            textures::LAYERS,
+            &atlas.normal,
+            false,
+        );
         let color_view = color.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -839,12 +1253,18 @@ impl Renderer {
             multisample: Default::default(),
             multiview: None,
         });
+        let point_shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Point shadow"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/point_shadow.wgsl").into(),
+            ),
+        });
         let point_shadow_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Point shadows"),
                 layout: Some(&point_shadow_pl),
                 vertex: wgpu::VertexState {
-                    module: &gbuffer_shader,
+                    module: &point_shadow_shader,
                     entry_point: "vs_point_shadow",
                     compilation_options: Default::default(),
                     buffers: &buffers,
@@ -862,6 +1282,130 @@ impl Renderer {
                 multisample: Default::default(),
                 multiview: None,
             });
+
+        let (sky_height, sky_height_view) = target(
+            &device,
+            "Top-down sky height",
+            SKY_HEIGHT_SIZE,
+            SKY_HEIGHT_SIZE,
+            wgpu::TextureFormat::Depth32Float,
+            1,
+        );
+
+        let sun_data = celestial::generate_sun_texture(CELESTIAL_TEX_SIZE);
+        let moon_data = celestial::generate_moon_texture(CELESTIAL_TEX_SIZE);
+        let sun_tex = upload_texture_mips(
+            &device,
+            &queue,
+            "Procedural Sun",
+            CELESTIAL_TEX_SIZE,
+            CELESTIAL_TEX_SIZE,
+            1,
+            &sun_data,
+            true,
+        );
+        let moon_tex = upload_texture_mips(
+            &device,
+            &queue,
+            "Procedural Moon",
+            CELESTIAL_TEX_SIZE,
+            CELESTIAL_TEX_SIZE,
+            1,
+            &moon_data,
+            false,
+        );
+        let sun_view = sun_tex.create_view(&Default::default());
+        let moon_view = moon_tex.create_view(&Default::default());
+        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Celestial & cloud sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let cloud_noise_data = celestial::generate_cloud_noise_3d(CLOUD_NOISE_SIZE);
+        let cloud_noise_3d = upload_texture_3d(
+            &device,
+            &queue,
+            "3D cloud Perlin-Worley noise",
+            CLOUD_NOISE_SIZE,
+            &cloud_noise_data,
+        );
+        let cloud_noise_view = cloud_noise_3d.create_view(&Default::default());
+
+        let weather_data = celestial::generate_weather_texture(WEATHER_TEX_SIZE);
+        let weather_tex = upload_texture_mips(
+            &device,
+            &queue,
+            "Cloud weather LUT",
+            WEATHER_TEX_SIZE,
+            WEATHER_TEX_SIZE,
+            1,
+            &weather_data,
+            false,
+        );
+        let weather_view = weather_tex.create_view(&Default::default());
+        let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Repeating 3D/2D cloud noise sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            ..Default::default()
+        });
+
+        let clouds_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Clouds layout"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(
+                    1,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                texture_entry(
+                    2,
+                    wgpu::TextureViewDimension::D3,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    3,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    4,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler_entry(5, false),
+                sampler_entry(6, false),
+            ],
+        });
+
+        let sky_height_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Sky height"),
+            layout: Some(&shadow_pl),
+            vertex: wgpu::VertexState {
+                module: &gbuffer_shader,
+                entry_point: "vs_sky_height",
+                compilation_options: Default::default(),
+                buffers: &buffers,
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_state(Default::default())),
+            multisample: Default::default(),
+            multiview: None,
+        });
 
         let deferred_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Deferred lighting layout"),
@@ -898,56 +1442,205 @@ impl Renderer {
                     wgpu::TextureViewDimension::D2Array,
                     wgpu::TextureSampleType::Depth,
                 ),
+                texture_entry(
+                    8,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    9,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    10,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler_entry(11, false),
+                texture_entry(
+                    12,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
             ],
         });
+        let gi_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GI layout"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(
+                    1,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    2,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                texture_entry(
+                    3,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    4,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    5,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                sampler_entry(6, false),
+            ],
+        });
+        let bilateral_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Bilateral filter layout"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(
+                    1,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    2,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    3,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                sampler_entry(4, false),
+            ],
+        });
+        let volumetric_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Volumetric light layout"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(
+                    1,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                texture_entry(
+                    2,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                sampler_entry(3, true),
+                texture_entry(
+                    4,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler_entry(5, false),
+                texture_entry(
+                    6,
+                    wgpu::TextureViewDimension::D3,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler_entry(7, false),
+            ],
+        });
+        let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Composite layout"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(
+                    1,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    2,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    3,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    4,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    5,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_entry(
+                    6,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Depth,
+                ),
+                sampler_entry(7, false),
+            ],
+        });
+
         let deferred_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Deferred PBR + SSAO"),
+            label: Some("Deferred PBR + SSAO + Sky"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("../../../assets/shaders/deferred.wgsl").into(),
             ),
         });
-        let deferred_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Deferred"),
-            bind_group_layouts: &[&deferred_layout],
-            push_constant_ranges: &[],
+        let clouds_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Procedural clouds"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/clouds.wgsl").into(),
+            ),
         });
-        let deferred_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Deferred lighting"),
-            layout: Some(&deferred_pl),
-            vertex: wgpu::VertexState {
-                module: &deferred_shader,
-                entry_point: "vs_main",
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &deferred_shader,
-                entry_point: "fs_main",
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
+        let gi_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Global illumination"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/gi.wgsl").into(),
+            ),
         });
-        let deferred_viewmodel_pipeline =
+        let bilateral_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Joint bilateral denoiser"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/bilateral.wgsl").into(),
+            ),
+        });
+        let volumetric_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Volumetric light"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/volumetric.wgsl").into(),
+            ),
+        });
+        let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HDR composite"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/composite.wgsl").into(),
+            ),
+        });
+
+        let make_fullscreen = |label, layout: &wgpu::BindGroupLayout, module, entry| {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[layout],
+                push_constant_ranges: &[],
+            });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Deferred viewmodel lighting"),
-                layout: Some(&deferred_pl),
+                label: Some(label),
+                layout: Some(&pl),
                 vertex: wgpu::VertexState {
-                    module: &deferred_shader,
+                    module,
                     entry_point: "vs_main",
                     compilation_options: Default::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &deferred_shader,
-                    entry_point: "fs_viewmodel",
+                    module,
+                    entry_point: entry,
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
@@ -959,7 +1652,52 @@ impl Renderer {
                 depth_stencil: None,
                 multisample: Default::default(),
                 multiview: None,
-            });
+            })
+        };
+
+        let clouds_pipeline = make_fullscreen(
+            "Volumetric clouds",
+            &clouds_layout,
+            &clouds_shader,
+            "fs_main",
+        );
+        let deferred_pipeline = make_fullscreen(
+            "Deferred lighting",
+            &deferred_layout,
+            &deferred_shader,
+            "fs_main",
+        );
+        let deferred_viewmodel_pipeline = make_fullscreen(
+            "Deferred viewmodel lighting",
+            &deferred_layout,
+            &deferred_shader,
+            "fs_viewmodel",
+        );
+        let gi_pipeline = make_fullscreen("Global illumination", &gi_layout, &gi_shader, "fs_gi");
+        let gi_blur_pipeline = make_fullscreen(
+            "GI bilateral blur",
+            &bilateral_layout,
+            &bilateral_shader,
+            "fs_gi_blur",
+        );
+        let volumetric_pipeline = make_fullscreen(
+            "Volumetric shafts",
+            &volumetric_layout,
+            &volumetric_shader,
+            "fs_main",
+        );
+        let vol_blur_pipeline = make_fullscreen(
+            "Volumetric bilateral blur",
+            &bilateral_layout,
+            &bilateral_shader,
+            "fs_vol_blur",
+        );
+        let composite_pipeline = make_fullscreen(
+            "HDR composite",
+            &composite_layout,
+            &composite_shader,
+            "fs_main",
+        );
 
         let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Bloom layout"),
@@ -999,20 +1737,30 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let targets = create_targets(
-            &device,
-            config.width,
-            config.height,
-            &globals,
-            &shadow_view,
-            &point_shadow_array_view,
-            &shadow_sampler,
-            &deferred_layout,
-            &bloom_layout,
-            &post_layout,
-            &post_uniform,
-            &post_sampler,
-        );
+        let target_ctx = TargetContext {
+            globals: &globals,
+            shadow_view: &shadow_view,
+            point_shadow_array_view: &point_shadow_array_view,
+            shadow_sampler: &shadow_sampler,
+            sky_height_view: &sky_height_view,
+            sun_view: &sun_view,
+            moon_view: &moon_view,
+            cloud_noise_view: &cloud_noise_view,
+            weather_view: &weather_view,
+            cloud_sampler: &cloud_sampler,
+            sky_sampler: &sky_sampler,
+            clouds_layout: &clouds_layout,
+            deferred_layout: &deferred_layout,
+            gi_layout: &gi_layout,
+            bilateral_layout: &bilateral_layout,
+            volumetric_layout: &volumetric_layout,
+            composite_layout: &composite_layout,
+            bloom_layout: &bloom_layout,
+            post_layout: &post_layout,
+            post_uniform: &post_uniform,
+            post_sampler: &post_sampler,
+        };
+        let targets = create_targets(&device, config.width, config.height, &target_ctx);
         let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Mip bloom"),
             source: wgpu::ShaderSource::Wgsl(
@@ -1053,6 +1801,8 @@ impl Renderer {
         let bloom_prefilter_pipeline = make_bloom_pipeline("Bloom prefilter", "fs_prefilter", None);
         let bloom_downsample_pipeline =
             make_bloom_pipeline("Bloom downsample", "fs_downsample", None);
+        let direct_down_pipeline =
+            make_bloom_pipeline("Direct HDR downsample", "fs_box_downsample", None);
         let bloom_upsample_pipeline = make_bloom_pipeline(
             "Bloom upsample",
             "fs_upsample",
@@ -1110,26 +1860,54 @@ impl Renderer {
             point_shadow_uniforms,
             point_shadow_bindings,
             gbuffer_pipeline,
+            sky_height_pipeline,
+            clouds_pipeline,
             deferred_pipeline,
             deferred_viewmodel_pipeline,
+            gi_pipeline,
+            gi_blur_pipeline,
+            volumetric_pipeline,
+            vol_blur_pipeline,
+            composite_pipeline,
             shadow_pipeline,
             point_shadow_pipeline,
             bloom_prefilter_pipeline,
             bloom_downsample_pipeline,
+            direct_down_pipeline,
             bloom_upsample_pipeline,
             post_pipeline,
             _shadow: shadow,
             shadow_view,
+            _sky_height: sky_height,
+            sky_height_view,
             _point_shadow: point_shadow,
             point_shadow_array_view,
             point_shadow_face_views,
             shadow_sampler,
+            _sun_tex: sun_tex,
+            sun_view,
+            _moon_tex: moon_tex,
+            moon_view,
+            _cloud_noise_3d: cloud_noise_3d,
+            cloud_noise_view,
+            _weather_tex: weather_tex,
+            weather_view,
+            cloud_sampler,
+            sky_sampler,
+            clouds_layout,
             deferred_layout,
+            gi_layout,
+            bilateral_layout,
+            volumetric_layout,
+            composite_layout,
             bloom_layout,
             targets,
             post_layout,
             post_uniform,
             post_sampler,
+            prev_vp: Mat4::IDENTITY,
+            prev_eye: Vec3::ZERO,
+            frame_index: 0,
         })
     }
 
@@ -1183,20 +1961,31 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.targets = create_targets(
-            &self.device,
-            width,
-            height,
-            &self.globals,
-            &self.shadow_view,
-            &self.point_shadow_array_view,
-            &self.shadow_sampler,
-            &self.deferred_layout,
-            &self.bloom_layout,
-            &self.post_layout,
-            &self.post_uniform,
-            &self.post_sampler,
-        );
+        self.frame_index = 0;
+        let ctx = TargetContext {
+            globals: &self.globals,
+            shadow_view: &self.shadow_view,
+            point_shadow_array_view: &self.point_shadow_array_view,
+            shadow_sampler: &self.shadow_sampler,
+            sky_height_view: &self.sky_height_view,
+            sun_view: &self.sun_view,
+            moon_view: &self.moon_view,
+            cloud_noise_view: &self.cloud_noise_view,
+            weather_view: &self.weather_view,
+            cloud_sampler: &self.cloud_sampler,
+            sky_sampler: &self.sky_sampler,
+            clouds_layout: &self.clouds_layout,
+            deferred_layout: &self.deferred_layout,
+            gi_layout: &self.gi_layout,
+            bilateral_layout: &self.bilateral_layout,
+            volumetric_layout: &self.volumetric_layout,
+            composite_layout: &self.composite_layout,
+            bloom_layout: &self.bloom_layout,
+            post_layout: &self.post_layout,
+            post_uniform: &self.post_uniform,
+            post_sampler: &self.post_sampler,
+        };
+        self.targets = create_targets(&self.device, width, height, &ctx);
     }
 
     pub fn vsync(&mut self, on: bool) {
@@ -1234,11 +2023,13 @@ impl Renderer {
             settings.sun_azimuth,
             settings.sun_tilt,
         );
-        let shadow_dir = if sun.y >= -0.02 {
-            Vec3::new(sun.x, sun.y.max(0.06), sun.z).normalize()
-        } else {
-            Vec3::new(-sun.x, (-sun.y).max(0.18), -sun.z).normalize()
-        };
+        let moon = moon_direction(
+            settings.time_of_day,
+            settings.sun_azimuth,
+            settings.sun_tilt,
+            settings.moon_phase,
+        );
+        let (shadow_dir, _, _) = celestial::dominant_celestial_light(sun, moon);
         let shadow_ext = crate::units::world::SHADOW_EXTENT;
         let light =
             Mat4::orthographic_rh(-shadow_ext, shadow_ext, -shadow_ext, shadow_ext, 0.1, 100.0)
@@ -1247,7 +2038,15 @@ impl Renderer {
                     Vec3::new(0.0, 1.0, 0.0),
                     Vec3::Y,
                 );
-        let vp = camera.projection(aspect) * camera.view();
+        let view = camera.view();
+        let proj = camera.projection(aspect);
+        let vp = proj * view;
+        let sky_proj = Mat4::orthographic_rh(-16.0, 16.0, -16.0, 16.0, 0.1, 25.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 20.0, 0.0), Vec3::ZERO, Vec3::NEG_Z);
+        if self.frame_index == 0 {
+            self.prev_vp = vp;
+            self.prev_eye = camera.position;
+        }
 
         let count = point_lights.len().min(MAX_POINT_LIGHTS);
         let mut lights_arr = [PointLight::new(Vec3::ZERO, 1.0, [0.0; 3], 0.0); MAX_POINT_LIGHTS];
@@ -1257,15 +2056,48 @@ impl Renderer {
             vp: vp.to_cols_array_2d(),
             light: light.to_cols_array_2d(),
             inverse: vp.inverse().to_cols_array_2d(),
+            view: view.to_cols_array_2d(),
+            prev_vp: self.prev_vp.to_cols_array_2d(),
+            sky_proj: sky_proj.to_cols_array_2d(),
             eye: camera.position.extend(1.0).to_array(),
+            prev_eye: [
+                self.prev_eye.x,
+                self.prev_eye.y,
+                self.prev_eye.z,
+                self.frame_index as f32,
+            ],
+            proj_params: [
+                1.0 / proj.x_axis.x,
+                1.0 / proj.y_axis.y,
+                crate::units::camera::NEAR_CLIP_M,
+                crate::units::camera::FAR_CLIP_M,
+            ],
             sun: [sun.x, sun.y, sun.z, count as f32],
+            moon: [moon.x, moon.y, moon.z, settings.moon_phase],
             settings: [
                 settings.exposure,
                 settings.fog,
                 settings.shadows as f32,
                 if settings.ao { 1.0 } else { 0.0 },
             ],
-            sky: [time, 0.0, 0.0, 0.0],
+            sky: [
+                time,
+                settings.time_of_day,
+                settings.sun_azimuth.to_radians(),
+                settings.sun_tilt.clamp(10.0, 89.0).to_radians(),
+            ],
+            atmos: [
+                if settings.clouds { 1.0 } else { 0.0 },
+                settings.cloud_coverage,
+                if settings.show_trajectory { 1.0 } else { 0.0 },
+                aspect,
+            ],
+            gi_vol: [
+                if settings.gi { 1.0 } else { 0.0 },
+                settings.gi_intensity,
+                if settings.volumetric { 1.0 } else { 0.0 },
+                settings.volumetric_intensity,
+            ],
             lights: lights_arr,
         };
         self.queue
@@ -1353,6 +2185,26 @@ impl Renderer {
             }
         }
 
+        if settings.gi {
+            let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Sky height pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.sky_height_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            sky_pass.set_pipeline(&self.sky_height_pipeline);
+            sky_pass.set_bind_group(0, &self.shadow_bindings, &[]);
+            self.draw_pass(&mut sky_pass, draws, |d| !d.viewmodel);
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("GBuffer pass"),
@@ -1398,25 +2250,89 @@ impl Renderer {
             self.draw_pass(&mut pass, draws, |d| !d.viewmodel);
         }
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Deferred lighting pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.targets.hdr,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.deferred_pipeline);
-            pass.set_bind_group(0, &self.targets.deferred, &[]);
-            pass.draw(0..3, 0..1);
+        let slot = (self.frame_index & 1) as usize;
+        if settings.clouds {
+            let clouds_target = if slot == 0 {
+                &self.targets.clouds_a
+            } else {
+                &self.targets.clouds_b
+            };
+            fullscreen_pass(
+                encoder,
+                "Volumetric clouds pass",
+                clouds_target,
+                &self.clouds_pipeline,
+                &self.targets.clouds_bgs[slot],
+            );
         }
+
+        fullscreen_pass(
+            encoder,
+            "Deferred direct + sky pass",
+            &self.targets.direct_hdr_mips[0],
+            &self.deferred_pipeline,
+            &self.targets.deferred[slot],
+        );
+
+        if settings.gi {
+            for mip in 1..self.targets.direct_hdr_mips.len() {
+                fullscreen_pass(
+                    encoder,
+                    "Direct HDR mip downsample",
+                    &self.targets.direct_hdr_mips[mip],
+                    &self.direct_down_pipeline,
+                    &self.targets.direct_down_bgs[mip - 1],
+                );
+            }
+            let gi_target = if slot == 0 {
+                &self.targets.gi_a
+            } else {
+                &self.targets.gi_b
+            };
+            fullscreen_pass(
+                encoder,
+                "Global illumination pass",
+                gi_target,
+                &self.gi_pipeline,
+                &self.targets.gi_bgs[slot],
+            );
+            fullscreen_pass(
+                encoder,
+                "GI bilateral blur pass",
+                &self.targets.gi_filtered,
+                &self.gi_blur_pipeline,
+                &self.targets.gi_blur_bgs[slot],
+            );
+        }
+
+        if settings.volumetric {
+            fullscreen_pass(
+                encoder,
+                "Volumetric light pass",
+                &self.targets.vol_raw,
+                &self.volumetric_pipeline,
+                &self.targets.vol_bgs[slot],
+            );
+            fullscreen_pass(
+                encoder,
+                "Volumetric bilateral blur pass",
+                &self.targets.vol_filtered,
+                &self.vol_blur_pipeline,
+                &self.targets.vol_blur_bg,
+            );
+        }
+
+        fullscreen_pass(
+            encoder,
+            "HDR composite pass",
+            &self.targets.hdr,
+            &self.composite_pipeline,
+            &self.targets.composite_bg,
+        );
+
+        self.prev_vp = vp;
+        self.prev_eye = camera.position;
+        self.frame_index = self.frame_index.wrapping_add(1);
 
         if has_viewmodel {
             {
@@ -1479,7 +2395,7 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(&self.deferred_viewmodel_pipeline);
-                pass.set_bind_group(0, &self.targets.deferred, &[]);
+                pass.set_bind_group(0, &self.targets.deferred[slot], &[]);
                 pass.draw(0..3, 0..1);
             }
         }
@@ -1584,6 +2500,32 @@ impl Renderer {
     }
 }
 
+fn fullscreen_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    view: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 fn vertex_layouts() -> [wgpu::VertexBufferLayout<'static>; 2] {
     const V: [wgpu::VertexAttribute; 3] =
         wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2];
@@ -1602,20 +2544,24 @@ fn vertex_layouts() -> [wgpu::VertexBufferLayout<'static>; 2] {
     ]
 }
 
-fn upload_array(
+#[allow(clippy::too_many_arguments)]
+fn upload_texture_mips(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &str,
+    width: u32,
+    height: u32,
+    layers: u32,
     data: &[u8],
     srgb: bool,
 ) -> wgpu::Texture {
-    let levels = textures::SIZE.ilog2() + 1;
+    let levels = width.max(height).ilog2() + 1;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width: textures::SIZE,
-            height: textures::SIZE,
-            depth_or_array_layers: textures::LAYERS,
+            width,
+            height,
+            depth_or_array_layers: layers,
         },
         mip_level_count: levels,
         sample_count: 1,
@@ -1628,11 +2574,11 @@ fn upload_array(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for layer in 0..textures::LAYERS {
-        let bytes = (textures::SIZE * textures::SIZE * 4) as usize;
+    let bytes = (width * height * 4) as usize;
+    for layer in 0..layers {
         let mut img = image::RgbaImage::from_raw(
-            textures::SIZE,
-            textures::SIZE,
+            width,
+            height,
             data[layer as usize * bytes..(layer as usize + 1) * bytes].to_vec(),
         )
         .unwrap();
@@ -1670,5 +2616,48 @@ fn upload_array(
             }
         }
     }
+    tex
+}
+
+fn upload_texture_3d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    size: u32,
+    data: &[u8],
+) -> wgpu::Texture {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: size,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(size * 4),
+            rows_per_image: Some(size),
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: size,
+        },
+    );
     tex
 }

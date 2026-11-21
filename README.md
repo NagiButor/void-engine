@@ -1,16 +1,18 @@
 # V.O.I.D. Engine
 
-**Virtual Objects & Interactive Dynamics** — native Rust 3D engine (`wgpu` + Rapier 3D) with deferred PBR lighting, omnidirectional point-light shadows, dynamic day/night cycle and a dev-textured lighting test room.
+**Virtual Objects & Interactive Dynamics** — native Rust 3D engine (`wgpu` + Rapier 3D) with deferred PBR lighting, Visibility Bitmask SSGI, volumetric clouds and light shafts, procedural Sun/Moon orbits, omnidirectional point-light shadows and a dev-textured lighting test room.
 
 The **0.2 Rust runtime** lives in `crates/void-engine` and `crates/void-demo`.
 
-![Deferred daylight & dev-textured test room — Vulkan](docs/rust-game.png)
+![Deferred daylight, Visibility Bitmask SSGI & procedural clouds — Vulkan](docs/rust-game.png)
 
 ![First-person pistol ADS iron-sight alignment](docs/rust-ads.png)
 
-![Night sky, moonlight & 6 draggable shadow-casting point lights](docs/rust-night.png)
+![Night sky, moonlight, clouds & 6 draggable shadow-casting point lights](docs/rust-night.png)
 
-![Sun & Day/Night control submenu at sunset](docs/rust-sun.png)
+![Sky, Sun & Moon orbital trajectory submenu at sunset](docs/rust-sun.png)
+
+![Graphics settings menu with GI, procedural clouds and volumetric lighting controls](docs/rust-settings.png)
 
 ## Build and run
 
@@ -40,17 +42,27 @@ beside the executable. CLI options override saved settings for the session.
 - **Rust workspace:** reusable engine library (`void-engine`) and game binary
   (`void-demo`) with pinned `Cargo.lock`; `wgpu` for native DX12/Vulkan, `winit`
   for input/windowing, Rapier 3D for physics and `rodio` for spatial audio.
-- **Deferred PBR rendering:** 3-target MRT G-Buffer (`Rgba8UnormSrgb` albedo +
-  metallic, `Rgba16Float` world normals + roughness, `Rgba16Float` emissive)
-  with `Depth32Float` world-position reconstruction, Cook–Torrance GGX shading,
-  normal-aware 12-sample SSAO, HDR bloom, edge AA, ACES tonemapping and vignette.
+- **Deferred PBR rendering & Visibility Bitmask GI:** 3-target MRT G-Buffer
+  (`Rgba8UnormSrgb` albedo + metallic, `Rgba16Float` world normals + roughness,
+  `Rgba16Float` emissive) with `Depth32Float` position reconstruction,
+  Cook–Torrance GGX shading, Visibility Bitmask SSGI (`gi.wgsl`) with 32-bit
+  horizon bitmasks, 4-mip `direct_hdr` color bleeding, `256²` `sky_height_map`
+  indoor occlusion, temporal reprojection and normal+depth bilateral denoising
+  (`bilateral.wgsl`, `composite.wgsl`), plus HDR bloom, edge AA, ACES
+  tonemapping and vignette.
+- **Volumetric Clouds & Light Shafts:** quarter-resolution volumetric cloud
+  raymarching (`clouds.wgsl`) driven by 64³ Perlin–Worley/Worley 3D noise and a
+  256² weather map (`celestial.rs`) with Henyey–Greenstein phase scattering and
+  temporal reprojection, paired with shadowed quarter-resolution Sun/Moon
+  volumetric god-rays (`volumetric.wgsl`) and depth-aware bilateral upsampling.
 - **Shadows:** 4096² directional sun/moon shadow map with 16-tap rotated Poisson
   PCF, plus 512²×6 omnidirectional shadow cube arrays (`D2Array`, up to 8 point
   lights) with 8-tap rotated Poisson PCF and normal-offset bias.
-- **Dynamic Sun & Day/Night Cycle:** dedicated **УПРАВЛЕНИЕ СОЛНЦЕМ** submenu
-  from the main or pause menu with live time-of-day (`00:00`–`24:00`), azimuth
-  and orbit-tilt sliders, Dawn/Day/Sunset/Night presets, optional real-time cycle,
-  atmospheric sunset glow, procedural twinkling stars and cool moonlight.
+- **Dynamic Sky, Sun, Moon & Trajectories:** dedicated **НЕБО, СОЛНЦЕ И ЛУНА**
+  submenu with a live 2D orbital diagram, time-of-day (`00:00`–`24:00`), orbit
+  azimuth/tilt, lunar phase and cloud coverage sliders, Dawn/Day/Sunset/Night
+  presets, optional real-time cycle, procedural 512² Sun & lunar-phase Moon
+  textures, dotted celestial orbit arcs in the sky, and twinkling night stars.
 - **Dev-Textured Lighting Test Room (`30×30 m`, 1:1 SI Metric):** world-scale
   tiled `Grid_4x4` CC0 dev textures (`1.0 m` tile = `0.25 m` per cell) with
   tangent normal and roughness maps, real-world-proportioned architectural
@@ -118,27 +130,31 @@ cargo run --release --locked -p void-demo -- --selftest
 
 `--selftest` checks gravity/settling, picking, spring movement and throwing
 without opening a window. Unit tests cover audio limiting/panning, physics
-collision filtering, dev-texture atlas loading and `naga` WGSL validation of
-`gbuffer.wgsl`, `deferred.wgsl` and `post.wgsl`.
+collision filtering, dev-texture atlas loading, celestial trajectories/textures
+and `naga` WGSL validation of all 10 GPU shaders (`gbuffer.wgsl`,
+`point_shadow.wgsl`, `clouds.wgsl`, `deferred.wgsl`, `gi.wgsl`,
+`volumetric.wgsl`, `bilateral.wgsl`, `composite.wgsl`, `bloom.wgsl`, `post.wgsl`).
 
 Other flags: `--rhi=dx12|vulkan|auto`, `--adapter=N`, `--width=N`, `--height=N`,
-`--fullscreen`, `--autostart`, `--showcase`, `--settings`, `--sun`, `--time=H`,
-`--novsync`, `--validation`, `--no-prompt`, `--help`.
+`--fullscreen`, `--autostart`, `--showcase`, `--ads`, `--settings`, `--sun`,
+`--time=H`, `--novsync`, `--validation`, `--no-prompt`, `--help`.
 
 ### Measured Rust build
 
-NVIDIA GeForce GTX 960M (Vulkan), `1600×900`, deferred PBR + 4K sun shadows +
-6×512²×6 omnidirectional point-light shadows + normal-aware SSAO, 100 measured
-frames after 30 warm-up frames (2026-11-21):
+NVIDIA GeForce GTX 960M (Vulkan), `1920×1080`, deferred PBR + 4K sun shadows +
+6×512²×6 point-light shadows + Visibility Bitmask SSGI + quarter-res volumetric
+clouds + volumetric light shafts + 5-mip HDR bloom, 240 measured frames
+(2026-11-21):
 
-- `60.1 FPS` average, `55.0 FPS` 1% low, `17.17 ms` p95 frame time (`36` draws).
+- `58.9 FPS` average, `19.21 ms` p95 frame time (`44` draws).
 
 ## Architecture
 
 ```text
 crates/void-engine/src/
   units.rs        1:1 SI metric scale, RH Y-up coordinates & human/world/prop ratios
-  render.rs       wgpu device, G-Buffer/shadow/deferred/post passes & sun math
+  celestial.rs    sun/moon orbital math, procedural 512² discs, 64³ cloud noise & weather map
+  render.rs       wgpu device, G-Buffer/shadow/clouds/deferred/GI/volumetric/bloom/post passes
   mesh.rs         bevelled boxes with world-scale tiled UVs, spheres, lathes
   textures.rs     DevTextures PNG atlas loader (albedo + roughness + normal)
   glb.rs          static GLB scene/accessor/embedded-image loader
@@ -148,12 +164,18 @@ crates/void-engine/src/
   audio.rs        spatial voices, HDR mixer, limiter, surface footsteps & WAV loading
 crates/void-demo/src/
   main.rs         event loop, player, light grabbing (E), menu/HUD routing
-  ui.rs           minimal HUD, menu, settings and Sun/Day-Night control UI
+  ui.rs           minimal HUD, menu, settings and Sky/Sun/Moon orbital control UI
   settings.rs     validated persisted TOML settings
 assets/shaders/
-  gbuffer.wgsl    MRT G-Buffer geometry + sun/point-light depth passes
-  deferred.wgsl   deferred GGX PBR, Poisson PCF shadows, SSAO, day/night sky
-  bloom.wgsl      5-mip Karis-prefiltered downsample + 9-tap tent upsample bloom
+  gbuffer.wgsl    MRT G-Buffer geometry + sun shadow & top-down sky-height depth passes
+  point_shadow.wgsl  64 B dynamic-offset omnidirectional point-light depth pass
+  clouds.wgsl     quarter-res 3D Perlin-Worley volumetric cloud raymarch + temporal reprojection
+  deferred.wgsl   deferred GGX PBR, Poisson PCF shadows, textured Sun/Moon, orbital arcs & sky
+  gi.wgsl         half-res Visibility Bitmask SSGI with mipmapped direct bounce & sky occlusion
+  volumetric.wgsl quarter-res shadowed Sun/Moon volumetric light shafts + animated dust
+  bilateral.wgsl  normal+depth joint bilateral denoiser for GI & volumetric buffers
+  composite.wgsl  exact texel-aligned bilateral GI & volumetric HDR composite
+  bloom.wgsl      5-mip Karis bloom pyramid + 4-tap box downsample for GI direct HDR mips
   post.wgsl       bloom composite, luma edge AA, ACES tonemapping and vignette
 ```
 

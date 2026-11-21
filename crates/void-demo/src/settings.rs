@@ -16,6 +16,12 @@ pub struct Settings {
     pub fog: f32,
     pub ao: bool,
     pub bloom: bool,
+    pub gi: bool,
+    pub gi_intensity: f32,
+    pub clouds: bool,
+    pub cloud_coverage: f32,
+    pub volumetric: bool,
+    pub volumetric_intensity: f32,
     pub fov: f32,
     pub eye_height: f32,
     pub camera_side: f32,
@@ -31,6 +37,8 @@ pub struct Settings {
     pub time_of_day: f32,
     pub sun_azimuth: f32,
     pub sun_tilt: f32,
+    pub moon_phase: f32,
+    pub show_trajectory: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -43,6 +51,12 @@ impl Default for Settings {
             fog: 0.6,
             ao: true,
             bloom: true,
+            gi: true,
+            gi_intensity: 1.0,
+            clouds: true,
+            cloud_coverage: 0.52,
+            volumetric: true,
+            volumetric_intensity: 1.0,
             fov: camera::DEFAULT_HFOV_DEG,
             eye_height: human::EYE_HEIGHT,
             camera_side: 0.0,
@@ -58,6 +72,8 @@ impl Default for Settings {
             time_of_day: 13.5,
             sun_azimuth: -28.0,
             sun_tilt: 62.0,
+            moon_phase: 0.42,
+            show_trajectory: true,
         }
     }
 }
@@ -91,6 +107,9 @@ impl Settings {
         );
         s.exposure = clamp(s.exposure, 0.5, 1.6, 1.05);
         s.fog = clamp(s.fog, 0.0, 2.0, 0.6);
+        s.gi_intensity = clamp(s.gi_intensity, 0.0, 2.0, 1.0);
+        s.cloud_coverage = clamp(s.cloud_coverage, 0.0, 1.0, 0.52);
+        s.volumetric_intensity = clamp(s.volumetric_intensity, 0.0, 2.0, 1.0);
         // Migrate legacy center-relative eye offsets (< 1.2 m) to floor-relative POV height.
         let raw_eye = if s.eye_height.is_finite() && s.eye_height < 1.2 {
             s.eye_height + human::CENTER_HEIGHT
@@ -122,6 +141,7 @@ impl Settings {
         s.time_of_day = clamp(s.time_of_day, 0.0, 24.0, 13.5);
         s.sun_azimuth = clamp(s.sun_azimuth, -180.0, 180.0, -28.0);
         s.sun_tilt = clamp(s.sun_tilt, 15.0, 85.0, 62.0);
+        s.moon_phase = clamp(s.moon_phase, 0.0, 1.0, 0.42);
         s
     }
     pub fn save(&self) {
@@ -138,9 +158,17 @@ impl Settings {
             shadows: self.shadows,
             ao: self.ao,
             bloom: self.bloom,
+            gi: self.gi,
+            gi_intensity: self.gi_intensity,
+            clouds: self.clouds,
+            cloud_coverage: self.cloud_coverage,
+            volumetric: self.volumetric,
+            volumetric_intensity: self.volumetric_intensity,
             time_of_day: self.time_of_day,
             sun_azimuth: self.sun_azimuth,
             sun_tilt: self.sun_tilt,
+            moon_phase: self.moon_phase,
+            show_trajectory: self.show_trajectory,
         }
     }
 }

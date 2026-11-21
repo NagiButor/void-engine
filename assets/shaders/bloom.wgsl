@@ -91,3 +91,13 @@ fn karis_weight(c: vec3<f32>) -> f32 {
     let out = (a + c + g + i) * 0.0625 + (b + d + f + h) * 0.125 + e * 0.25;
     return vec4<f32>(out * 0.72, 1.0);
 }
+
+// Fast 4-tap bilinear box downsample for direct HDR GI mip chain.
+@fragment fn fs_box_downsample(v: Out) -> @location(0) vec4<f32> {
+    let t = (1.0 / vec2<f32>(textureDimensions(src_tex))) * 0.5;
+    let a = textureSample(src_tex, linear_sampler, v.uv + vec2<f32>(-t.x, -t.y)).rgb;
+    let b = textureSample(src_tex, linear_sampler, v.uv + vec2<f32>( t.x, -t.y)).rgb;
+    let c = textureSample(src_tex, linear_sampler, v.uv + vec2<f32>(-t.x,  t.y)).rgb;
+    let d = textureSample(src_tex, linear_sampler, v.uv + vec2<f32>( t.x,  t.y)).rgb;
+    return vec4<f32>((a + b + c + d) * 0.25, 1.0);
+}

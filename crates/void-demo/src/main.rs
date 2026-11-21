@@ -1062,6 +1062,9 @@ impl Game {
             self.settings.time_of_day = defaults.time_of_day;
             self.settings.sun_azimuth = defaults.sun_azimuth;
             self.settings.sun_tilt = defaults.sun_tilt;
+            self.settings.moon_phase = defaults.moon_phase;
+            self.settings.cloud_coverage = defaults.cloud_coverage;
+            self.settings.show_trajectory = defaults.show_trajectory;
             self.sun = SunState::default();
         }
         if actions.to_menu {

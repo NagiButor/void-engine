@@ -1478,7 +1478,7 @@ fn draw_menu_overlay(
                             ui,
                             nav,
                             "btn_sun",
-                            "УПРАВЛЕНИЕ СОЛНЦЕМ",
+                            "НЕБО, СОЛНЦЕ И ЛУНА",
                             "02",
                             false,
                             bw,
@@ -1523,7 +1523,7 @@ fn draw_menu_overlay(
                             ui,
                             nav,
                             "btn_sun",
-                            "УПРАВЛЕНИЕ СОЛНЦЕМ",
+                            "НЕБО, СОЛНЦЕ И ЛУНА",
                             "03",
                             false,
                             bw,
@@ -1830,6 +1830,36 @@ fn draw_settings_overlay(
                                             ) {
                                                 actions.click_sfx = true;
                                             }
+                                            if void_toggle(
+                                                ui,
+                                                nav,
+                                                "t_gi",
+                                                "Global Illumination (Visibility Bitmask SSGI)",
+                                                "Отражённый непрямой свет и цветоперенос между поверхностями",
+                                                &mut settings.gi,
+                                            ) {
+                                                actions.click_sfx = true;
+                                            }
+                                            if void_toggle(
+                                                ui,
+                                                nav,
+                                                "t_clouds",
+                                                "Процедурные облака",
+                                                "Объёмная облачность с физическим рассеянием света",
+                                                &mut settings.clouds,
+                                            ) {
+                                                actions.click_sfx = true;
+                                            }
+                                            if void_toggle(
+                                                ui,
+                                                nav,
+                                                "t_volumetric",
+                                                "Волуметрический свет",
+                                                "Объёмные лучи от солнца и луны через тени",
+                                                &mut settings.volumetric,
+                                            ) {
+                                                actions.click_sfx = true;
+                                            }
                                             ui.add_space(4.0);
                                             void_slider(
                                                 ui,
@@ -1849,6 +1879,39 @@ fn draw_settings_overlay(
                                                 0.0..=2.0,
                                                 |v| format!("{v:.2}"),
                                             );
+                                            if settings.gi {
+                                                void_slider(
+                                                    ui,
+                                                    nav,
+                                                    "s_gi_int",
+                                                    "Интенсивность GI",
+                                                    &mut settings.gi_intensity,
+                                                    0.0..=2.0,
+                                                    |v| format!("{v:.2}"),
+                                                );
+                                            }
+                                            if settings.clouds {
+                                                void_slider(
+                                                    ui,
+                                                    nav,
+                                                    "s_clouds_cov",
+                                                    "Плотность облаков",
+                                                    &mut settings.cloud_coverage,
+                                                    0.0..=1.0,
+                                                    |v| format!("{:.0}%", v * 100.0),
+                                                );
+                                            }
+                                            if settings.volumetric {
+                                                void_slider(
+                                                    ui,
+                                                    nav,
+                                                    "s_vol_int",
+                                                    "Интенсивность лучей",
+                                                    &mut settings.volumetric_intensity,
+                                                    0.0..=2.0,
+                                                    |v| format!("{v:.2}"),
+                                                );
+                                            }
                                         }
                                         SettingsTab::Camera => {
                                             void_slider(
@@ -2132,6 +2195,108 @@ fn day_phase(elev: f32, time_of_day: f32) -> (&'static str, Color32) {
     }
 }
 
+fn format_moon_phase(phase: f32) -> String {
+    let p = phase.rem_euclid(1.0);
+    let label = if !(0.08..0.92).contains(&p) {
+        "Новолуние"
+    } else if p < 0.22 {
+        "Молодая"
+    } else if p < 0.34 {
+        "1-я четв."
+    } else if p < 0.45 {
+        "Прибыв."
+    } else if p < 0.56 {
+        "Полнолуние"
+    } else if p < 0.70 {
+        "Убывающая"
+    } else {
+        "3-я четв."
+    };
+    format!(
+        "{label} ({:.0}%)",
+        (1.0 - (p - 0.5).abs() * 2.0).clamp(0.0, 1.0) * 100.0
+    )
+}
+
+fn draw_celestial_diagram(
+    ui: &mut Ui,
+    settings: &Settings,
+    sun_dir: glam::Vec3,
+    moon_dir: glam::Vec3,
+) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(EguiVec2::new(w, 66.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        Rounding::same(10.0),
+        Color32::from_rgba_unmultiplied(10, 14, 21, 210),
+    );
+    p.rect_stroke(rect, Rounding::same(10.0), stroke(1.0, BORDER_SUBTLE));
+
+    let pad_x = 12.0;
+    let horizon_y = rect.bottom() - 20.0;
+    let top_y = rect.top() + 9.0;
+    let bot_y = rect.bottom() - 6.0;
+    let left_x = rect.left() + pad_x;
+    let right_x = rect.right() - pad_x;
+
+    // Horizon line
+    p.line_segment(
+        [Pos2::new(left_x, horizon_y), Pos2::new(right_x, horizon_y)],
+        stroke(1.0, rgba(TEXT_MUTED, 110)),
+    );
+    p.text(
+        Pos2::new(left_x + 2.0, horizon_y - 3.0),
+        Align2::LEFT_BOTTOM,
+        "ГОРИЗОНТ",
+        FontId::monospace(8.5),
+        TEXT_MUTED,
+    );
+
+    let to_pos = |hour: f32, dir: glam::Vec3| -> Pos2 {
+        let t = hour.rem_euclid(24.0) / 24.0;
+        let x = left_x + t * (right_x - left_x);
+        let y = if dir.y >= 0.0 {
+            horizon_y - dir.y * (horizon_y - top_y)
+        } else {
+            horizon_y - dir.y * (bot_y - horizon_y)
+        };
+        Pos2::new(x, y)
+    };
+
+    let steps = 48;
+    let sun_pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let h = (i as f32 / steps as f32) * 24.0;
+            let d = void_engine::render::sun_direction(h, settings.sun_azimuth, settings.sun_tilt);
+            to_pos(h, d)
+        })
+        .collect();
+    let moon_pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let h = (i as f32 / steps as f32) * 24.0;
+            let d = void_engine::render::moon_direction(
+                h,
+                settings.sun_azimuth,
+                settings.sun_tilt,
+                settings.moon_phase,
+            );
+            to_pos(h, d)
+        })
+        .collect();
+
+    p.add(Shape::line(moon_pts, stroke(1.4, rgba(CYAN, 145))));
+    p.add(Shape::line(sun_pts, stroke(1.8, rgba(AMBER, 195))));
+
+    let cur_sun = to_pos(settings.time_of_day, sun_dir);
+    let cur_moon = to_pos(settings.time_of_day, moon_dir);
+    p.circle_filled(cur_moon, 6.0, rgba(CYAN, 48));
+    p.circle_filled(cur_moon, 3.6, Color32::from_rgb(210, 232, 255));
+    p.circle_filled(cur_sun, 7.5, rgba(AMBER, 60));
+    p.circle_filled(cur_sun, 4.4, AMBER_BRIGHT);
+}
+
 fn draw_sun_overlay(
     ctx: &egui::Context,
     snap: &HudSnapshot<'_>,
@@ -2145,20 +2310,27 @@ fn draw_sun_overlay(
         settings.sun_azimuth,
         settings.sun_tilt,
     );
+    let moon_dir = void_engine::render::moon_direction(
+        settings.time_of_day,
+        settings.sun_azimuth,
+        settings.sun_tilt,
+        settings.moon_phase,
+    );
     let elev_deg = dir.y.clamp(-1.0, 1.0).asin().to_degrees();
+    let moon_elev_deg = moon_dir.y.clamp(-1.0, 1.0).asin().to_degrees();
     let (phase_label, phase_col) = day_phase(dir.y, settings.time_of_day);
 
-    let card_w = 404.0;
+    let card_w = 408.0;
     egui::Area::new(Id::new("sun_card"))
-        .anchor(Align2::LEFT_CENTER, EguiVec2::new(40.0, 0.0))
+        .anchor(Align2::LEFT_BOTTOM, EguiVec2::new(36.0, -36.0))
         .show(ctx, |ui| {
             let resp = egui::Frame::none()
                 .fill(BG_DEEP)
                 .stroke(stroke(1.0, BORDER_MID))
                 .rounding(Rounding::same(16.0))
-                .inner_margin(Margin::same(24.0))
+                .inner_margin(Margin::same(18.0))
                 .show(ui, |ui| {
-                    ui.set_width(card_w - 48.0);
+                    ui.set_width(card_w - 36.0);
 
                     ui.horizontal(|ui| {
                         let (emblem_r, _) =
@@ -2174,16 +2346,17 @@ fn draw_sun_overlay(
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.label(
-                                egui::RichText::new("УПРАВЛЕНИЕ СОЛНЦЕМ")
+                                egui::RichText::new("НЕБО, СОЛНЦЕ И ЛУНА")
                                     .size(16.5)
                                     .color(TEXT_PRIMARY)
                                     .strong(),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Время {} · Высота {:+.0}° · {}",
+                                    "{} · ☀ {:+.0}° · ☾ {:+.0}° · {}",
                                     format_clock(settings.time_of_day),
                                     elev_deg,
+                                    moon_elev_deg,
                                     phase_label
                                 ))
                                 .font(FontId::monospace(10.5))
@@ -2192,7 +2365,9 @@ fn draw_sun_overlay(
                         });
                     });
 
-                    ui.add_space(14.0);
+                    ui.add_space(8.0);
+                    draw_celestial_diagram(ui, settings, dir, moon_dir);
+                    ui.add_space(8.0);
 
                     void_slider(
                         ui,
@@ -2222,12 +2397,12 @@ fn draw_sun_overlay(
                         }
                     });
 
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
                     void_slider(
                         ui,
                         nav,
                         "sun_az",
-                        "Азимут (двигать солнце)",
+                        "Азимут орбит",
                         &mut settings.sun_azimuth,
                         -180.0..=180.0,
                         |v| format!("{v:+.0}°"),
@@ -2241,14 +2416,42 @@ fn draw_sun_overlay(
                         15.0..=85.0,
                         |v| format!("{v:.0}°"),
                     );
+                    void_slider(
+                        ui,
+                        nav,
+                        "moon_phase",
+                        "Фаза и орбита луны",
+                        &mut settings.moon_phase,
+                        0.0..=1.0,
+                        format_moon_phase,
+                    );
+                    void_slider(
+                        ui,
+                        nav,
+                        "sun_clouds",
+                        "Плотность облаков",
+                        &mut settings.cloud_coverage,
+                        0.0..=1.0,
+                        |v| format!("{:.0}%", v * 100.0),
+                    );
 
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
+                    if void_toggle(
+                        ui,
+                        nav,
+                        "sun_traj",
+                        "Траектория светил в небе",
+                        "Орбитальные дуги солнца и луны в небе",
+                        &mut settings.show_trajectory,
+                    ) {
+                        actions.click_sfx = true;
+                    }
                     if void_toggle(
                         ui,
                         nav,
                         "sun_auto",
                         "Авто-смена дня и ночи",
-                        "Плавное движение солнца в реальном времени",
+                        "Плавное движение солнца и луны в реальном времени",
                         &mut sun.auto_cycle,
                     ) {
                         actions.click_sfx = true;

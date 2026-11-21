@@ -1,5 +1,6 @@
 //! V.O.I.D.'s Rust runtime. Right-handed Y-up coordinate system, 1:1 SI metric scale (1 unit = 1 m).
 pub mod audio;
+pub mod celestial;
 pub mod glb;
 pub mod input;
 pub mod locomotion;
@@ -58,6 +59,27 @@ mod shader_tests {
             ),
             ("post", include_str!("../../../assets/shaders/post.wgsl")),
             ("bloom", include_str!("../../../assets/shaders/bloom.wgsl")),
+            (
+                "point_shadow",
+                include_str!("../../../assets/shaders/point_shadow.wgsl"),
+            ),
+            (
+                "clouds",
+                include_str!("../../../assets/shaders/clouds.wgsl"),
+            ),
+            ("gi", include_str!("../../../assets/shaders/gi.wgsl")),
+            (
+                "volumetric",
+                include_str!("../../../assets/shaders/volumetric.wgsl"),
+            ),
+            (
+                "bilateral",
+                include_str!("../../../assets/shaders/bilateral.wgsl"),
+            ),
+            (
+                "composite",
+                include_str!("../../../assets/shaders/composite.wgsl"),
+            ),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
