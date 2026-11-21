@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use void_engine::render::RenderSettings;
+use void_engine::{
+    render::RenderSettings,
+    units::{camera, human},
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,7 +20,11 @@ pub struct Settings {
     pub eye_height: f32,
     pub camera_side: f32,
     pub sensitivity: f32,
+    pub invert_y: bool,
     pub head_bob: bool,
+    pub gamepad_sensitivity: f32,
+    pub gamepad_deadzone: f32,
+    pub gamepad_vibration: bool,
     pub volume: f32,
     pub hdr_audio: f32,
     pub muted: bool,
@@ -36,11 +43,15 @@ impl Default for Settings {
             fog: 0.6,
             ao: true,
             bloom: true,
-            fov: 78.0,
-            eye_height: 0.85,
+            fov: camera::DEFAULT_HFOV_DEG,
+            eye_height: human::EYE_HEIGHT,
             camera_side: 0.0,
-            sensitivity: 1.0,
+            sensitivity: camera::SENSITIVITY_DEFAULT,
+            invert_y: false,
             head_bob: true,
+            gamepad_sensitivity: 1.0,
+            gamepad_deadzone: 0.12,
+            gamepad_vibration: true,
             volume: 0.75,
             hdr_audio: 0.8,
             muted: false,
@@ -72,12 +83,40 @@ impl Settings {
         s.width = s.width.clamp(640, 3840);
         s.height = s.height.clamp(360, 2160);
         s.shadows = s.shadows.min(2);
-        s.fov = clamp(s.fov, 65.0, 110.0, 78.0);
+        s.fov = clamp(
+            s.fov,
+            camera::HFOV_MIN_DEG,
+            camera::HFOV_MAX_DEG,
+            camera::DEFAULT_HFOV_DEG,
+        );
         s.exposure = clamp(s.exposure, 0.5, 1.6, 1.05);
         s.fog = clamp(s.fog, 0.0, 2.0, 0.6);
-        s.eye_height = clamp(s.eye_height, 0.70, 1.0, 0.85);
-        s.camera_side = clamp(s.camera_side, -0.2, 0.2, 0.0);
-        s.sensitivity = clamp(s.sensitivity, 0.2, 3.0, 1.0);
+        // Migrate legacy center-relative eye offsets (< 1.2 m) to floor-relative POV height.
+        let raw_eye = if s.eye_height.is_finite() && s.eye_height < 1.2 {
+            s.eye_height + human::CENTER_HEIGHT
+        } else {
+            s.eye_height
+        };
+        s.eye_height = clamp(
+            raw_eye,
+            human::EYE_HEIGHT_MIN,
+            human::EYE_HEIGHT_MAX,
+            human::EYE_HEIGHT,
+        );
+        s.camera_side = clamp(
+            s.camera_side,
+            -camera::SIDE_OFFSET_MAX_M,
+            camera::SIDE_OFFSET_MAX_M,
+            0.0,
+        );
+        s.sensitivity = clamp(
+            s.sensitivity,
+            camera::SENSITIVITY_MIN,
+            camera::SENSITIVITY_MAX,
+            camera::SENSITIVITY_DEFAULT,
+        );
+        s.gamepad_sensitivity = clamp(s.gamepad_sensitivity, 0.25, 3.0, 1.0);
+        s.gamepad_deadzone = clamp(s.gamepad_deadzone, 0.04, 0.30, 0.12);
         s.volume = clamp(s.volume, 0.0, 1.0, 0.75);
         s.hdr_audio = clamp(s.hdr_audio, 0.0, 1.0, 0.8);
         s.time_of_day = clamp(s.time_of_day, 0.0, 24.0, 13.5);

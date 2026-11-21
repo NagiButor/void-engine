@@ -1,4 +1,6 @@
+use crate::units;
 use glam::{Quat, Vec3};
+pub use rapier3d::prelude::RigidBodyHandle;
 use rapier3d::prelude::*;
 
 pub const FIXED_DT: f32 = 1.0 / 60.0;
@@ -24,6 +26,13 @@ fn groups(category: u32, filter: u32) -> InteractionGroups {
         Group::from_bits_truncate(category),
         Group::from_bits_truncate(filter),
     )
+}
+
+pub struct RaycastHit {
+    pub body: RigidBodyHandle,
+    pub dist: f32,
+    pub point: Vec3,
+    pub normal: Vec3,
 }
 
 pub enum Shape {
@@ -133,8 +142,8 @@ impl Physics {
                 .build(),
         );
         self.colliders.insert_with_parent(
-            ColliderBuilder::capsule_y(0.49, 0.30)
-                .mass(78.0)
+            ColliderBuilder::capsule_y(units::human::CAPSULE_HALF_SEGMENT, units::human::RADIUS)
+                .mass(units::human::MASS_KG)
                 .friction(0.0)
                 .restitution(0.0)
                 .collision_groups(groups(PLAYER, WORLD | PROP))
@@ -158,7 +167,7 @@ impl Physics {
             ..Default::default()
         };
         self.pipeline.step(
-            &vector![0.0, -9.81, 0.0],
+            &vector(units::coord::GRAVITY_DIR * units::coord::GRAVITY_MPS2),
             &params,
             &mut self.islands,
             &mut self.broad,
@@ -242,6 +251,46 @@ impl Physics {
             .and_then(|(c, distance)| self.colliders[c].parent().map(|body| (body, distance)))
     }
 
+    pub fn raycast_detailed(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max: f32,
+        exclude: RigidBodyHandle,
+    ) -> Option<RaycastHit> {
+        let unit = dir.normalize_or_zero();
+        if unit == Vec3::ZERO {
+            return None;
+        }
+        let ray = Ray::new(point![origin.x, origin.y, origin.z], vector(unit));
+        let filter = QueryFilter::default()
+            .exclude_rigid_body(exclude)
+            .groups(groups(PLAYER, WORLD | PROP));
+        self.query
+            .cast_ray_and_get_normal(&self.bodies, &self.colliders, &ray, max, true, filter)
+            .and_then(|(c, inter)| {
+                self.colliders[c].parent().map(|body| RaycastHit {
+                    body,
+                    dist: inter.time_of_impact,
+                    point: origin + unit * inter.time_of_impact,
+                    normal: vec3(&inter.normal).normalize_or_zero(),
+                })
+            })
+    }
+
+    pub fn apply_impulse_at_point(&mut self, body: RigidBodyHandle, impulse: Vec3, point: Vec3) {
+        if let Some(b) = self.bodies.get_mut(body) {
+            if b.is_dynamic() {
+                b.wake_up(true);
+                b.apply_impulse_at_point(vector(impulse), point![point.x, point.y, point.z], true);
+            }
+        }
+    }
+
+    pub fn body_exists(&self, body: RigidBodyHandle) -> bool {
+        self.bodies.get(body).is_some()
+    }
+
     pub fn hold_filter(&mut self, body: RigidBodyHandle, held: bool) {
         let handles = self.bodies[body].colliders().to_vec();
         for c in handles {
@@ -254,8 +303,9 @@ impl Physics {
     pub fn spring(&mut self, body: RigidBodyHandle, target: Vec3) {
         let b = &mut self.bodies[body];
         let delta = target - vec3(b.translation());
-        let acceleration =
-            (delta * 115.0 - vec3(b.linvel()) * 19.0 + Vec3::Y * 9.81).clamp_length_max(180.0);
+        let acceleration = (delta * 115.0 - vec3(b.linvel()) * 19.0
+            + units::coord::UP * units::coord::GRAVITY_MPS2)
+            .clamp_length_max(180.0);
         b.reset_forces(true);
         b.add_force(vector(acceleration * b.mass()), true);
         b.set_angvel(*b.angvel() * 0.93, true);

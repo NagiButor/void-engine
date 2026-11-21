@@ -178,6 +178,34 @@ pub fn cylinder(radius: f32, height: f32, slices: u32) -> MeshData {
     )
 }
 
+pub fn quad(half_x: f32, half_y: f32) -> MeshData {
+    MeshData {
+        vertices: vec![
+            Vertex {
+                position: [-half_x, -half_y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 1.0],
+            },
+            Vertex {
+                position: [half_x, -half_y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [1.0, 1.0],
+            },
+            Vertex {
+                position: [half_x, half_y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [1.0, 0.0],
+            },
+            Vertex {
+                position: [-half_x, half_y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+            },
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
+}
+
 pub fn segment(from: Vec3, to: Vec3, r0: f32, r1: f32) -> MeshData {
     let d = to - from;
     let len = d.length();

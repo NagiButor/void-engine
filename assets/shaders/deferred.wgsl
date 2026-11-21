@@ -321,18 +321,7 @@ fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
     return sky;
 }
 
-@fragment fn fs_main(v: Out) -> @location(0) vec4<f32> {
-    let dims = vec2<i32>(textureDimensions(g_depth));
-    let pixel = clamp(vec2<i32>(v.clip.xy), vec2<i32>(0), dims - 1);
-    let depth = textureLoad(g_depth, pixel, 0);
-    let sun = normalize(g.sun.xyz);
-
-    if depth >= 0.999999 {
-        let far_world = reconstruct_world(v.uv, 1.0);
-        let ray = normalize(far_world - g.eye.xyz);
-        return vec4<f32>(sky_color(ray, sun, true), 1.0);
-    }
-
+fn shade_gbuffer(pixel: vec2<i32>, dims: vec2<i32>, uv: vec2<f32>, depth: f32, sun: vec3<f32>) -> vec4<f32> {
     let albedo_metal = textureLoad(g_albedo_metal, pixel, 0);
     let normal_rough = textureLoad(g_normal_rough, pixel, 0);
     let emissive = textureLoad(g_emissive, pixel, 0);
@@ -341,7 +330,7 @@ fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
     let metal = albedo_metal.a;
     let n = normalize(normal_rough.xyz);
     let rough = normal_rough.a;
-    let world = reconstruct_world(v.uv, depth);
+    let world = reconstruct_world(uv, depth);
     let view = normalize(g.eye.xyz - world);
 
     let elev = sun.y;
@@ -349,7 +338,7 @@ fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
     let night = 1.0 - smoothstep(-0.18, 0.05, elev);
     let sunset = exp(-pow((elev - 0.02) / 0.15, 2.0));
 
-    let ao = compute_ssao(pixel, dims, v.uv, world, n);
+    let ao = compute_ssao(pixel, dims, uv, world, n);
     let shadow_dir = select(moon_direction(sun), sun, elev >= -0.02);
     let visibility = shadow_visibility(pixel, world, n, shadow_dir);
 
@@ -409,4 +398,30 @@ fn sky_color(dir: vec3<f32>, sun: vec3<f32>, draw_discs: bool) -> vec3<f32> {
     let fog_color = mix(mix(fog_night, fog_day, day), fog_sunset, sunset * 0.7) * (1.0 - night * 0.15);
     let fog = 1.0 - exp(-length(g.eye.xyz - world) * 0.004 * g.settings.y);
     return vec4<f32>(mix(light, fog_color, fog), 1.0);
+}
+
+@fragment fn fs_main(v: Out) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(g_depth));
+    let pixel = clamp(vec2<i32>(v.clip.xy), vec2<i32>(0), dims - 1);
+    let depth = textureLoad(g_depth, pixel, 0);
+    let sun = normalize(g.sun.xyz);
+
+    if depth >= 0.999999 {
+        let far_world = reconstruct_world(v.uv, 1.0);
+        let ray = normalize(far_world - g.eye.xyz);
+        return vec4<f32>(sky_color(ray, sun, true), 1.0);
+    }
+
+    return shade_gbuffer(pixel, dims, v.uv, depth, sun);
+}
+
+@fragment fn fs_viewmodel(v: Out) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(g_depth));
+    let pixel = clamp(vec2<i32>(v.clip.xy), vec2<i32>(0), dims - 1);
+    let depth = textureLoad(g_depth, pixel, 0);
+    if depth >= 0.999999 {
+        discard;
+    }
+    let sun = normalize(g.sun.xyz);
+    return shade_gbuffer(pixel, dims, v.uv, depth, sun);
 }

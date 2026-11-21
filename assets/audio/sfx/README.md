@@ -20,7 +20,7 @@ back to its small procedural synthesizer, so the demo still runs.
 | `spawn.wav` | prop spawn and scene reset |
 | `slowmo_on.wav`, `slowmo_off.wav` | slow-motion toggle |
 | `ui_click.wav` | menu, pause and button clicks |
-| `footstep_1.wav`, `footstep_2.wav` | player footsteps |
+| `footsteps/<surface>_01..05.wav` | surface-aware player footsteps (18 surfaces × 5 variations from Footsteps Mini Sound Pack, converted to 48 kHz mono PCM_16 with per-surface `gain_trim` and `FootstepGait` synchronization; `pavement_tiles` used for the test hall floor, `metal_steps` for metallic blocks/barrels) |
 
 Regenerate with either the official Hugging Face Space or a local checkout of
 the [MOSS-TTS](https://github.com/OpenMOSS/MOSS-TTS) pipeline:

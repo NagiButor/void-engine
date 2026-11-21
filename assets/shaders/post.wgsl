@@ -2,6 +2,7 @@ struct Post { settings: vec4<f32> };
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var linear_sampler: sampler;
 @group(0) @binding(2) var<uniform> post: Post;
+@group(0) @binding(3) var bloom_tex: texture_2d<f32>;
 
 struct Out { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -21,15 +22,6 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
     let dims = vec2<f32>(textureDimensions(hdr));
     let texel = 1.0 / dims;
 
-    var bloom = vec3<f32>(0.0);
-    for (var i = 0; i < 8; i++) {
-        let angle = f32(i) * 2.39996;
-        let radius = 3.0 + f32(i % 3) * 3.5;
-        let offset = vec2<f32>(cos(angle), sin(angle)) * radius * 2.4 * texel;
-        let b = textureSample(hdr, linear_sampler, v.uv + offset).rgb;
-        bloom += max(b - vec3<f32>(1.15), vec3<f32>(0.0));
-    }
-
     let center = textureSample(hdr, linear_sampler, v.uv).rgb;
     let north = textureSample(hdr, linear_sampler, v.uv + vec2<f32>(0.0, -texel.y)).rgb;
     let south = textureSample(hdr, linear_sampler, v.uv + vec2<f32>(0.0, texel.y)).rgb;
@@ -40,7 +32,10 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
         - min(min(dot(north, luma), dot(south, luma)), min(dot(west, luma), dot(east, luma)));
     let aa = smoothstep(0.09, 0.40, range) * 0.45;
     var color = mix(center, (north + south + west + east) * 0.25, aa);
-    color += bloom * (0.028 * post.settings.z);
+
+    let bloom = textureSample(bloom_tex, linear_sampler, v.uv).rgb;
+    color += bloom * (0.14 * post.settings.z);
+
     color = aces(color * post.settings.x);
     let vignette = 1.0 - smoothstep(0.25, 0.85, length(v.uv - 0.5)) * 0.12;
     return vec4<f32>(color * vignette, 1.0);

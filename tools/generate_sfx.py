@@ -68,14 +68,6 @@ CLIPS = [
     ("ui_click",
      "A crisp sci-fi interface button click, short, clean, close, no music, no voice",
      0.6, 41),
-    ("footstep_1",
-     "A work boot stepping on a concrete warehouse floor, single close footstep, dry, "
-     "no music, no voice",
-     0.6, 51),
-    ("footstep_2",
-     "A work boot stepping on a concrete warehouse floor, single close footstep with a "
-     "slight heel scuff, dry, no music, no voice",
-     0.6, 52),
 ]
 
 

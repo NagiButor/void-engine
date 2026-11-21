@@ -16,6 +16,7 @@ const POINT_SHADOW_SIZE: u32 = 512;
 pub const MAX_POINT_LIGHTS: usize = 16;
 const MAX_SHADOW_LIGHTS: usize = 8;
 const POINT_UNIFORM_STRIDE: usize = 256;
+const BLOOM_MIPS: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -67,6 +68,7 @@ pub struct Draw {
     pub transform: Mat4,
     pub material: Material,
     pub shadow: bool,
+    pub viewmodel: bool,
 }
 impl Draw {
     pub fn new(mesh: MeshId, transform: Mat4, material: Material) -> Self {
@@ -75,6 +77,7 @@ impl Draw {
             transform,
             material,
             shadow: true,
+            viewmodel: false,
         }
     }
 }
@@ -116,34 +119,54 @@ pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    pub roll: f32,
+    /// `Hor+` (`16:9` reference) horizontal field of view in degrees.
     pub fov: f32,
 }
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            position: Vec3::new(0.0, 1.66, 13.0),
+            position: Vec3::new(
+                0.0,
+                crate::units::human::EYE_HEIGHT + crate::units::human::SPAWN_CLEARANCE,
+                10.5,
+            ),
             yaw: 0.0,
             pitch: -0.07,
-            fov: 78.0,
+            roll: 0.0,
+            fov: crate::units::camera::DEFAULT_HFOV_DEG,
         }
     }
 }
 impl Camera {
     pub fn forward(&self) -> Vec3 {
-        Vec3::new(
-            -self.yaw.sin() * self.pitch.cos(),
-            self.pitch.sin(),
-            -self.yaw.cos() * self.pitch.cos(),
-        )
+        crate::units::coord::forward_from_yaw_pitch(self.yaw, self.pitch)
     }
     pub fn right(&self) -> Vec3 {
-        Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin())
+        crate::units::coord::right_from_yaw(self.yaw)
     }
     pub fn world(&self) -> Mat4 {
         self.view().inverse()
     }
     pub fn view(&self) -> Mat4 {
-        Mat4::look_at_rh(self.position, self.position + self.forward(), Vec3::Y)
+        let forward = self.forward();
+        let up = if self.roll.abs() > 1e-6 {
+            glam::Quat::from_axis_angle(forward, self.roll) * Vec3::Y
+        } else {
+            Vec3::Y
+        };
+        Mat4::look_at_rh(self.position, self.position + forward, up)
+    }
+    pub fn vertical_fov_rad(&self) -> f32 {
+        crate::units::camera::vfov_rad_from_hfov_16_9(self.fov)
+    }
+    pub fn projection(&self, aspect: f32) -> Mat4 {
+        Mat4::perspective_rh(
+            self.vertical_fov_rad(),
+            aspect.max(0.1),
+            crate::units::camera::NEAR_CLIP_M,
+            crate::units::camera::FAR_CLIP_M,
+        )
     }
 }
 
@@ -201,6 +224,10 @@ struct Targets {
     depth: wgpu::TextureView,
     _hdr: wgpu::Texture,
     hdr: wgpu::TextureView,
+    _bloom: wgpu::Texture,
+    bloom_mips: Vec<wgpu::TextureView>,
+    bloom_down_bgs: Vec<wgpu::BindGroup>,
+    bloom_up_bgs: Vec<wgpu::BindGroup>,
     deferred: wgpu::BindGroup,
     post: wgpu::BindGroup,
 }
@@ -220,8 +247,12 @@ pub struct Renderer {
     point_shadow_bindings: wgpu::BindGroup,
     gbuffer_pipeline: wgpu::RenderPipeline,
     deferred_pipeline: wgpu::RenderPipeline,
+    deferred_viewmodel_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     point_shadow_pipeline: wgpu::RenderPipeline,
+    bloom_prefilter_pipeline: wgpu::RenderPipeline,
+    bloom_downsample_pipeline: wgpu::RenderPipeline,
+    bloom_upsample_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
     _shadow: wgpu::Texture,
     shadow_view: wgpu::TextureView,
@@ -230,6 +261,7 @@ pub struct Renderer {
     point_shadow_face_views: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
     deferred_layout: wgpu::BindGroupLayout,
+    bloom_layout: wgpu::BindGroupLayout,
     targets: Targets,
     post_layout: wgpu::BindGroupLayout,
     post_uniform: wgpu::Buffer,
@@ -272,6 +304,7 @@ fn create_targets(
     point_shadow_array_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
     deferred_layout: &wgpu::BindGroupLayout,
+    bloom_layout: &wgpu::BindGroupLayout,
     post_layout: &wgpu::BindGroupLayout,
     post_uniform: &wgpu::Buffer,
     post_sampler: &wgpu::Sampler,
@@ -316,6 +349,54 @@ fn create_targets(
         wgpu::TextureFormat::Rgba16Float,
         1,
     );
+    let bw = (w / 2).max(1);
+    let bh = (h / 2).max(1);
+    let mip_count = bw.max(bh).ilog2().saturating_add(1).clamp(1, BLOOM_MIPS);
+    let bloom_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Bloom mip chain"),
+        size: wgpu::Extent3d {
+            width: bw,
+            height: bh,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: mip_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let bloom_mips: Vec<wgpu::TextureView> = (0..mip_count)
+        .map(|mip| {
+            bloom_tex.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let bloom_bg = |view: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bloom pass bindings"),
+            layout: bloom_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(post_sampler),
+                },
+            ],
+        })
+    };
+    let mut bloom_down_bgs = Vec::with_capacity(mip_count as usize);
+    bloom_down_bgs.push(bloom_bg(&hdr));
+    for view in bloom_mips.iter().take(mip_count as usize - 1) {
+        bloom_down_bgs.push(bloom_bg(view));
+    }
+    let bloom_up_bgs: Vec<wgpu::BindGroup> = bloom_mips.iter().skip(1).map(&bloom_bg).collect();
     let deferred = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Deferred lighting bindings"),
         layout: deferred_layout,
@@ -370,6 +451,10 @@ fn create_targets(
                 binding: 2,
                 resource: post_uniform.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&bloom_mips[0]),
+            },
         ],
     });
     Targets {
@@ -383,6 +468,10 @@ fn create_targets(
         depth,
         _hdr: hdr_tex,
         hdr,
+        _bloom: bloom_tex,
+        bloom_mips,
+        bloom_down_bgs,
+        bloom_up_bgs,
         deferred,
         post,
     }
@@ -846,7 +935,43 @@ impl Renderer {
             multisample: Default::default(),
             multiview: None,
         });
+        let deferred_viewmodel_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Deferred viewmodel lighting"),
+                layout: Some(&deferred_pl),
+                vertex: wgpu::VertexState {
+                    module: &deferred_shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &deferred_shader,
+                    entry_point: "fs_viewmodel",
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview: None,
+            });
 
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Bloom layout"),
+            entries: &[
+                texture_entry(
+                    0,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler_entry(1, false),
+            ],
+        });
         let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Post layout"),
             entries: &[
@@ -857,6 +982,11 @@ impl Renderer {
                 ),
                 sampler_entry(1, false),
                 uniform_entry(2),
+                texture_entry(
+                    3,
+                    wgpu::TextureViewDimension::D2,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
             ],
         });
         let post_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -878,9 +1008,62 @@ impl Renderer {
             &point_shadow_array_view,
             &shadow_sampler,
             &deferred_layout,
+            &bloom_layout,
             &post_layout,
             &post_uniform,
             &post_sampler,
+        );
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Mip bloom"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/bloom.wgsl").into(),
+            ),
+        });
+        let bloom_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Bloom"),
+            bind_group_layouts: &[&bloom_layout],
+            push_constant_ranges: &[],
+        });
+        let make_bloom_pipeline = |label, entry, blend| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&bloom_pl),
+                vertex: wgpu::VertexState {
+                    module: &bloom_shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bloom_shader,
+                    entry_point: entry,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview: None,
+            })
+        };
+        let bloom_prefilter_pipeline = make_bloom_pipeline("Bloom prefilter", "fs_prefilter", None);
+        let bloom_downsample_pipeline =
+            make_bloom_pipeline("Bloom downsample", "fs_downsample", None);
+        let bloom_upsample_pipeline = make_bloom_pipeline(
+            "Bloom upsample",
+            "fs_upsample",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            }),
         );
         let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Bloom ACES"),
@@ -928,8 +1111,12 @@ impl Renderer {
             point_shadow_bindings,
             gbuffer_pipeline,
             deferred_pipeline,
+            deferred_viewmodel_pipeline,
             shadow_pipeline,
             point_shadow_pipeline,
+            bloom_prefilter_pipeline,
+            bloom_downsample_pipeline,
+            bloom_upsample_pipeline,
             post_pipeline,
             _shadow: shadow,
             shadow_view,
@@ -938,6 +1125,7 @@ impl Renderer {
             point_shadow_face_views,
             shadow_sampler,
             deferred_layout,
+            bloom_layout,
             targets,
             post_layout,
             post_uniform,
@@ -946,14 +1134,27 @@ impl Renderer {
     }
 
     pub fn mesh(&mut self, data: &MeshData) -> MeshId {
+        self.upload_mesh(data, false)
+    }
+
+    pub fn dynamic_mesh(&mut self, data: &MeshData) -> MeshId {
+        self.upload_mesh(data, true)
+    }
+
+    fn upload_mesh(&mut self, data: &MeshData, dynamic: bool) -> MeshId {
         let id = self.meshes.len();
+        let usage = if dynamic {
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
+        } else {
+            wgpu::BufferUsages::VERTEX
+        };
         self.meshes.push(GpuMesh {
             vertices: self
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Mesh vertices"),
                     contents: bytemuck::cast_slice(&data.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage,
                 }),
             indices: self
                 .device
@@ -965,6 +1166,14 @@ impl Renderer {
             count: data.indices.len() as u32,
         });
         id
+    }
+
+    pub fn update_mesh(&self, id: MeshId, data: &MeshData) {
+        self.queue.write_buffer(
+            &self.meshes[id].vertices,
+            0,
+            bytemuck::cast_slice(&data.vertices),
+        );
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -983,6 +1192,7 @@ impl Renderer {
             &self.point_shadow_array_view,
             &self.shadow_sampler,
             &self.deferred_layout,
+            &self.bloom_layout,
             &self.post_layout,
             &self.post_uniform,
             &self.post_sampler,
@@ -1011,8 +1221,9 @@ impl Renderer {
     ) {
         assert!(draws.len() < MAX_INSTANCES, "Scene exceeds instance budget");
         let mut sorted = draws.to_vec();
-        sorted.sort_by_key(|d| (d.shadow, d.mesh));
+        sorted.sort_by_key(|d| (d.viewmodel, d.shadow, d.mesh));
         let draws = sorted.as_slice();
+        let has_viewmodel = draws.iter().any(|d| d.viewmodel);
         let instances: Vec<Instance> = draws.iter().map(Instance::from).collect();
         self.queue
             .write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
@@ -1028,13 +1239,15 @@ impl Renderer {
         } else {
             Vec3::new(-sun.x, (-sun.y).max(0.18), -sun.z).normalize()
         };
-        let light = Mat4::orthographic_rh(-30.0, 30.0, -30.0, 30.0, 0.1, 100.0)
-            * Mat4::look_at_rh(
-                Vec3::new(0.0, 1.0, 0.0) + shadow_dir * 50.0,
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::Y,
-            );
-        let vp = Mat4::perspective_rh(camera.fov.to_radians(), aspect, 0.06, 160.0) * camera.view();
+        let shadow_ext = crate::units::world::SHADOW_EXTENT;
+        let light =
+            Mat4::orthographic_rh(-shadow_ext, shadow_ext, -shadow_ext, shadow_ext, 0.1, 100.0)
+                * Mat4::look_at_rh(
+                    Vec3::new(0.0, 1.0, 0.0) + shadow_dir * 50.0,
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::Y,
+                );
+        let vp = camera.projection(aspect) * camera.view();
 
         let count = point_lights.len().min(MAX_POINT_LIGHTS);
         let mut lights_arr = [PointLight::new(Vec3::ZERO, 1.0, [0.0; 3], 0.0); MAX_POINT_LIGHTS];
@@ -1182,7 +1395,7 @@ impl Renderer {
             });
             pass.set_pipeline(&self.gbuffer_pipeline);
             pass.set_bind_group(0, &self.gbuffer_bindings, &[]);
-            self.draw_pass(&mut pass, draws, |_| true);
+            self.draw_pass(&mut pass, draws, |d| !d.viewmodel);
         }
 
         {
@@ -1203,6 +1416,122 @@ impl Renderer {
             pass.set_pipeline(&self.deferred_pipeline);
             pass.set_bind_group(0, &self.targets.deferred, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        if has_viewmodel {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("GBuffer viewmodel pass"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.targets.albedo_metal,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.targets.normal_rough,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.targets.emissive,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.gbuffer_pipeline);
+                pass.set_bind_group(0, &self.gbuffer_bindings, &[]);
+                self.draw_pass(&mut pass, draws, |d| d.viewmodel);
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Deferred viewmodel lighting pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.hdr,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.deferred_viewmodel_pipeline);
+                pass.set_bind_group(0, &self.targets.deferred, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+
+        if settings.bloom {
+            let mips = self.targets.bloom_mips.len();
+            for i in 0..mips {
+                let mut bpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(if i == 0 {
+                        "Bloom prefilter"
+                    } else {
+                        "Bloom downsample"
+                    }),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.bloom_mips[i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                bpass.set_pipeline(if i == 0 {
+                    &self.bloom_prefilter_pipeline
+                } else {
+                    &self.bloom_downsample_pipeline
+                });
+                bpass.set_bind_group(0, &self.targets.bloom_down_bgs[i], &[]);
+                bpass.draw(0..3, 0..1);
+            }
+            for i in (0..mips.saturating_sub(1)).rev() {
+                let mut upass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Bloom upsample"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.bloom_mips[i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                upass.set_pipeline(&self.bloom_upsample_pipeline);
+                upass.set_bind_group(0, &self.targets.bloom_up_bgs[i], &[]);
+                upass.draw(0..3, 0..1);
+            }
         }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1235,7 +1564,11 @@ impl Renderer {
         while i < draws.len() {
             let d = &draws[i];
             let mut end = i + 1;
-            while end < draws.len() && draws[end].mesh == d.mesh && draws[end].shadow == d.shadow {
+            while end < draws.len()
+                && draws[end].mesh == d.mesh
+                && draws[end].shadow == d.shadow
+                && draws[end].viewmodel == d.viewmodel
+            {
                 end += 1;
             }
             if !filter(d) {

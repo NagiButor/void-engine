@@ -65,10 +65,17 @@ struct GBufferOut {
 }
 
 @fragment fn fs_main(v: Varying) -> GBufferOut {
-    let layer = min(i32(v.surface.w + 0.5), 4);
+    let layer = clamp(i32(v.surface.w + 0.5), 0, 10);
     let tex = textureSample(colors, material_sampler, v.uv, layer);
+    if layer >= 8 && tex.a < 0.25 {
+        discard;
+    }
     let albedo = max(tex.rgb * v.color.rgb, vec3<f32>(0.001));
-    let rough = clamp(v.surface.x * tex.a / 0.7, 0.16, 0.98);
+    let rough = select(
+        clamp(v.surface.x * tex.a / 0.7, 0.16, 0.98),
+        clamp(v.surface.x, 0.16, 0.98),
+        layer >= 8
+    );
     let metal = clamp(v.surface.y, 0.0, 1.0);
 
     var n = normalize(v.normal);

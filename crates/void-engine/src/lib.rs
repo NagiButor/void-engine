@@ -1,11 +1,15 @@
-//! V.O.I.D.'s Rust runtime. World and first-person geometry use metres, Y up.
+//! V.O.I.D.'s Rust runtime. Right-handed Y-up coordinate system, 1:1 SI metric scale (1 unit = 1 m).
 pub mod audio;
 pub mod glb;
+pub mod input;
+pub mod locomotion;
 pub mod mesh;
 pub mod physics;
 pub mod render;
 pub mod scene;
 pub mod textures;
+pub mod units;
+pub mod viewmodel;
 
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     pollster::block_on(future)
@@ -53,6 +57,7 @@ mod shader_tests {
                 include_str!("../../../assets/shaders/deferred.wgsl"),
             ),
             ("post", include_str!("../../../assets/shaders/post.wgsl")),
+            ("bloom", include_str!("../../../assets/shaders/bloom.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
